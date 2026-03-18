@@ -3,126 +3,127 @@ import { motion, AnimatePresence } from "framer-motion";
 import Webcam from "react-webcam";
 import * as faceapi from "@vladmandic/face-api";
 import {
-  Eye, Smile, Move, Layers, CheckCircle2, XCircle,
-  Loader2, ShieldCheck, ShieldX, RefreshCw, User, Timer,
-  ChevronRight, AlertTriangle, Zap
+  Eye, Smile, Move, Layers, CheckCircle2,
+  XCircle, Loader2, ShieldCheck, ShieldX,
+  RefreshCw, User, Timer, ChevronRight,
+  AlertTriangle, Zap, Activity,
 } from "lucide-react";
 import { Navbar } from "@/components/layout/Navbar";
 import { useToast } from "@/hooks/use-toast";
 
+// ─── Constants ────────────────────────────────────────────────────────────────
 const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
-const LIVENESS_TIMEOUT_MS = 15000; // 15 seconds
+const DETECTION_INTERVAL_MS = 350;   // Run detection every 350ms (not every frame)
+const LIVENESS_TIMEOUT_S = 20;       // 20 seconds to complete all checks
 
-// ─── Liveness helpers ─────────────────────────────────────────────────────────
+// EAR thresholds — these work for most faces under normal lighting
+const EAR_BLINK_CLOSED = 0.20;       // Eyes are considered closed below this
+const EAR_BLINK_OPEN   = 0.26;       // Eyes are considered open above this
 
-// Eye Aspect Ratio: ratio of eye height to eye width
-// Uses 6 facial landmarks per eye (from face-api 68-point model)
-function computeEAR(eyePoints: faceapi.Point[]): number {
-  // Vertical distances
-  const v1 = dist(eyePoints[1], eyePoints[5]);
-  const v2 = dist(eyePoints[2], eyePoints[4]);
-  // Horizontal distance
-  const h = dist(eyePoints[0], eyePoints[3]);
+// Lip openness threshold (pixels, normalised by face size later)
+const LIP_OPEN_PX  = 8;             // Mouth is open if inner lip gap > 8px
+const LIP_CLOSE_PX = 4;             // Mouth is closed if gap < 4px
+
+// Head movement threshold (pixels)
+const HEAD_MOVE_PX = 10;            // Nose must shift >10px from baseline
+
+// ─── EAR helper ───────────────────────────────────────────────────────────────
+function ptDist(a: faceapi.Point, b: faceapi.Point) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+// 6-point eye: [0]=outerCorner [1][2]=upper lid [3]=innerCorner [4][5]=lower lid
+function computeEAR(eye: faceapi.Point[]) {
+  const v1 = ptDist(eye[1], eye[5]);
+  const v2 = ptDist(eye[2], eye[4]);
+  const h  = ptDist(eye[0], eye[3]);
   return (v1 + v2) / (2.0 * h);
 }
 
-function dist(a: faceapi.Point, b: faceapi.Point): number {
-  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
-}
-
-// Compute centroid of a set of points
-function centroid(points: faceapi.Point[]): { x: number; y: number } {
-  const x = points.reduce((s, p) => s + p.x, 0) / points.length;
-  const y = points.reduce((s, p) => s + p.y, 0) / points.length;
-  return { x, y };
-}
-
-// Capture a grayscale pixel array from video element for texture analysis
-function getGrayscalePixels(video: HTMLVideoElement, canvas: HTMLCanvasElement): Uint8ClampedArray | null {
-  try {
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
-    canvas.width = 64;
-    canvas.height = 64;
-    ctx.drawImage(video, 0, 0, 64, 64);
-    const data = ctx.getImageData(0, 0, 64, 64).data;
-    const gray = new Uint8ClampedArray(64 * 64);
-    for (let i = 0; i < gray.length; i++) {
-      gray[i] = Math.round(0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2]);
-    }
-    return gray;
-  } catch {
-    return null;
-  }
-}
-
-// Mean absolute difference between two pixel arrays — measures temporal variation
-function pixelMAD(a: Uint8ClampedArray, b: Uint8ClampedArray): number {
-  let sum = 0;
-  for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
-  return sum / a.length;
-}
-
 // ─── Types ────────────────────────────────────────────────────────────────────
-
 interface LivenessState {
-  blinkDetected: boolean;
-  lipMovementDetected: boolean;
-  headMovementDetected: boolean;
-  textureVariationDetected: boolean;
+  blinkDetected:         boolean;
+  lipMovementDetected:   boolean;
+  headMovementDetected:  boolean;
+  textureDetected:       boolean;
 }
 
-type PageState = "idle" | "loading-models" | "camera-ready" | "monitoring" | "verifying" | "success" | "failed";
+type PageState =
+  | "idle"
+  | "loading-models"
+  | "camera-ready"
+  | "monitoring"
+  | "verifying"
+  | "success"
+  | "failed";
+
+// Active instruction shown to the user
+const INSTRUCTIONS = [
+  { key: "blinkDetected",        text: "👁  Please blink your eyes naturally" },
+  { key: "lipMovementDetected",  text: "👄  Open and close your mouth slightly" },
+  { key: "headMovementDetected", text: "↔️  Gently turn your head left or right" },
+  { key: "textureDetected",      text: "✅  Hold still — detecting skin texture…" },
+] as const;
 
 // ─── Component ────────────────────────────────────────────────────────────────
-
 export default function Login() {
-  const [pageState, setPageState] = useState<PageState>("idle");
-  const [email, setEmail] = useState("");
-  const [modelsLoaded, setModelsLoaded] = useState(false);
-  const [liveness, setLiveness] = useState<LivenessState>({
-    blinkDetected: false,
-    lipMovementDetected: false,
-    headMovementDetected: false,
-    textureVariationDetected: false,
+  const [pageState,     setPageState]     = useState<PageState>("idle");
+  const [email,         setEmail]         = useState("");
+  const [modelsLoaded,  setModelsLoaded]  = useState(false);
+  const [liveness,      setLiveness]      = useState<LivenessState>({
+    blinkDetected: false, lipMovementDetected: false,
+    headMovementDetected: false, textureDetected: false,
   });
-  const [timeLeft, setTimeLeft] = useState(LIVENESS_TIMEOUT_MS / 1000);
-  const [errorMessage, setErrorMessage] = useState("");
-  const [successMessage, setSuccessMessage] = useState("");
-  const [confidence, setConfidence] = useState<number | null>(null);
+  const [timeLeft,      setTimeLeft]      = useState(LIVENESS_TIMEOUT_S);
+  const [errorMsg,      setErrorMsg]      = useState("");
+  const [successMsg,    setSuccessMsg]    = useState("");
+  const [confidence,    setConfidence]    = useState<number | null>(null);
 
-  const webcamRef = useRef<Webcam>(null);
-  const offscreenCanvas = useRef<HTMLCanvasElement>(document.createElement("canvas"));
-  const animFrameRef = useRef<number>(0);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const livenessRef = useRef<LivenessState>(liveness);
-  const monitoringRef = useRef(false);
-
-  // Rolling state for detection logic
-  const prevEAR = useRef<number | null>(null);
-  const blinkFrames = useRef(0);
-  const prevMouthOpenness = useRef<number | null>(null);
-  const lipFrames = useRef(0);
-  const prevNosePos = useRef<{ x: number; y: number } | null>(null);
-  const headFrames = useRef(0);
-  const prevPixels = useRef<Uint8ClampedArray | null>(null);
-  const textureFrames = useRef(0);
+  // Live debug values (shown in monitoring mode)
+  const [debugEAR,      setDebugEAR]      = useState<number | null>(null);
+  const [debugLip,      setDebugLip]      = useState<number | null>(null);
 
   const { toast } = useToast();
+  const webcamRef = useRef<Webcam>(null);
 
-  // Keep ref in sync with state
+  // Interval handles
+  const detectionInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Ref-copy of liveness so the interval callback always sees latest state
+  const livenessRef = useRef<LivenessState>(liveness);
   useEffect(() => { livenessRef.current = liveness; }, [liveness]);
 
-  const allLivenessPassed = (l: LivenessState) =>
-    l.blinkDetected && l.lipMovementDetected && l.headMovementDetected && l.textureVariationDetected;
+  // Ref so the interval can stop itself
+  const monitoringActive = useRef(false);
+  // Prevent overlapping async calls inside the interval
+  const detectionRunning = useRef(false);
 
-  // ─── Load Models ─────────────────────────────────────────────────────────────
+  // ── Blink state machine ──────────────────────────────────────────────────
+  // Two-phase: wait for "closed" then wait for "open"
+  const eyeWasClosed = useRef(false);
+
+  // ── Lip state machine ────────────────────────────────────────────────────
+  // Track whether we've seen both an open and a closed state
+  const lipWasOpen   = useRef(false);
+  const lipWasClosed = useRef(false);
+  // Remember the initial nose position as a baseline
+  const noseBaseline = useRef<{ x: number; y: number } | null>(null);
+
+  // ── Texture: pixel variance across several samples ───────────────────────
+  const offCanvas = useRef(document.createElement("canvas"));
+  const prevPixels = useRef<Uint8ClampedArray | null>(null);
+  const textureScores = useRef<number[]>([]);
+
+  // ─── Load models (once) ────────────────────────────────────────────────────
   const loadModels = useCallback(async () => {
-    if (modelsLoaded) return;
+    if (modelsLoaded) { setPageState("camera-ready"); return; }
     setPageState("loading-models");
     try {
+      // Force CPU backend — avoids WebGL/WASM availability issues in iframes
       await faceapi.tf.setBackend("cpu");
       await faceapi.tf.ready();
+      // Load the three models we need for liveness + descriptor
       await Promise.all([
         faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
         faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
@@ -132,155 +133,172 @@ export default function Login() {
       setPageState("camera-ready");
     } catch (err) {
       console.error("Model load error:", err);
-      setErrorMessage("Failed to load AI models. Please refresh and try again.");
+      setErrorMsg("Failed to load AI models. Check your internet connection and refresh.");
       setPageState("failed");
     }
   }, [modelsLoaded]);
 
-  // ─── Reset state for retry ────────────────────────────────────────────────────
-  const resetLiveness = useCallback(() => {
-    setLiveness({ blinkDetected: false, lipMovementDetected: false, headMovementDetected: false, textureVariationDetected: false });
-    livenessRef.current = { blinkDetected: false, lipMovementDetected: false, headMovementDetected: false, textureVariationDetected: false };
-    setTimeLeft(LIVENESS_TIMEOUT_MS / 1000);
-    setErrorMessage("");
-    setSuccessMessage("");
-    setConfidence(null);
-    prevEAR.current = null;
-    blinkFrames.current = 0;
-    prevMouthOpenness.current = null;
-    lipFrames.current = 0;
-    prevNosePos.current = null;
-    headFrames.current = 0;
-    prevPixels.current = null;
-    textureFrames.current = 0;
-    monitoringRef.current = false;
-    cancelAnimationFrame(animFrameRef.current);
-    if (timerRef.current) clearInterval(timerRef.current);
-    setPageState("camera-ready");
+  // ─── Stop all intervals ────────────────────────────────────────────────────
+  const stopAll = useCallback(() => {
+    monitoringActive.current = false;
+    if (detectionInterval.current) { clearInterval(detectionInterval.current); detectionInterval.current = null; }
+    if (countdownInterval.current) { clearInterval(countdownInterval.current); countdownInterval.current = null; }
   }, []);
 
-  // ─── Liveness monitor loop ────────────────────────────────────────────────────
-  const runMonitorFrame = useCallback(async () => {
-    if (!monitoringRef.current) return;
+  // ─── Reset to camera-ready state ──────────────────────────────────────────
+  const resetLiveness = useCallback(() => {
+    stopAll();
+    const blank = { blinkDetected: false, lipMovementDetected: false, headMovementDetected: false, textureDetected: false };
+    setLiveness(blank);
+    livenessRef.current = blank;
+    eyeWasClosed.current = false;
+    lipWasOpen.current   = false;
+    lipWasClosed.current = false;
+    noseBaseline.current = null;
+    prevPixels.current   = null;
+    textureScores.current = [];
+    setDebugEAR(null);
+    setDebugLip(null);
+    setTimeLeft(LIVENESS_TIMEOUT_S);
+    setErrorMsg("");
+    setSuccessMsg("");
+    setConfidence(null);
+    setPageState("camera-ready");
+  }, [stopAll]);
 
+  // ─── Single detection tick (called by interval) ────────────────────────────
+  const runDetectionTick = useCallback(async () => {
+    // Guard: skip if already running or monitoring stopped
+    if (detectionRunning.current || !monitoringActive.current) return;
     const video = webcamRef.current?.video;
-    if (!video || video.readyState !== 4) {
-      animFrameRef.current = requestAnimationFrame(runMonitorFrame);
-      return;
-    }
+    if (!video || video.readyState !== 4) return;
 
+    detectionRunning.current = true;
     try {
-      const detection = await faceapi
+      // During liveness monitoring we only need landmarks — NOT the descriptor.
+      // Skipping withFaceDescriptor() makes each tick 3–4× faster on CPU.
+      const det = await faceapi
         .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
-        .withFaceLandmarks()
-        .withFaceDescriptor();
+        .withFaceLandmarks();
 
-      if (detection) {
-        const { landmarks } = detection;
-        const pts = landmarks.positions;
+      if (det) {
+        const pts = det.landmarks.positions;
 
-        // ── 1. Eye Blink (EAR) ─────────────────────────────────────────────────
-        // 68-point model: left eye = 36-41, right eye = 42-47
-        const leftEye = pts.slice(36, 42) as faceapi.Point[];
+        // ── 1. EYE BLINK ────────────────────────────────────────────────────
+        // 68-point map: left eye = pts[36..41], right eye = pts[42..47]
+        const leftEye  = pts.slice(36, 42) as faceapi.Point[];
         const rightEye = pts.slice(42, 48) as faceapi.Point[];
         const ear = (computeEAR(leftEye) + computeEAR(rightEye)) / 2;
-
-        const EAR_CLOSED = 0.21;
-        const EAR_OPEN = 0.25;
+        setDebugEAR(Math.round(ear * 1000) / 1000);
 
         if (!livenessRef.current.blinkDetected) {
-          if (prevEAR.current !== null) {
-            // Detect a blink: previously open → now closed → then back open
-            if (prevEAR.current > EAR_OPEN && ear < EAR_CLOSED) {
-              blinkFrames.current++;
-            } else if (blinkFrames.current > 0 && ear > EAR_OPEN) {
-              // Completed a blink
-              setLiveness(prev => ({ ...prev, blinkDetected: true }));
-            }
+          if (ear < EAR_BLINK_CLOSED) {
+            // Phase 1: eyes closed
+            eyeWasClosed.current = true;
+          } else if (ear > EAR_BLINK_OPEN && eyeWasClosed.current) {
+            // Phase 2: eyes back open after being closed → blink complete
+            eyeWasClosed.current = false;
+            setLiveness(prev => ({ ...prev, blinkDetected: true }));
           }
-          prevEAR.current = ear;
         }
 
-        // ── 2. Lip Movement (mouth openness) ───────────────────────────────────
-        // Mouth inner points: 60-67 (68-point model)
-        // Use vertical distance of top and bottom lip points (pts 62 vs 66)
-        const topLip = pts[62];
-        const bottomLip = pts[66];
-        const mouthH = Math.abs(topLip.y - bottomLip.y);
+        // ── 2. LIP MOVEMENT ─────────────────────────────────────────────────
+        // Inner mouth: pts[60..67]. Vertical gap = pts[62] (top) vs pts[66] (bottom)
+        const lipGap = Math.abs(pts[62].y - pts[66].y);
+        setDebugLip(Math.round(lipGap));
 
         if (!livenessRef.current.lipMovementDetected) {
-          if (prevMouthOpenness.current !== null) {
-            const delta = Math.abs(mouthH - prevMouthOpenness.current);
-            if (delta > 3) lipFrames.current++;
-            else lipFrames.current = Math.max(0, lipFrames.current - 1);
-            if (lipFrames.current >= 3) {
-              setLiveness(prev => ({ ...prev, lipMovementDetected: true }));
-            }
+          if (lipGap > LIP_OPEN_PX)  lipWasOpen.current   = true;
+          if (lipGap < LIP_CLOSE_PX) lipWasClosed.current = true;
+          // Must have seen BOTH open and closed to count as deliberate movement
+          if (lipWasOpen.current && lipWasClosed.current) {
+            setLiveness(prev => ({ ...prev, lipMovementDetected: true }));
           }
-          prevMouthOpenness.current = mouthH;
         }
 
-        // ── 3. Head Movement (nose tip position) ──────────────────────────────
-        // Nose tip: pt[30]
-        const noseTip = pts[30];
-
+        // ── 3. HEAD MOVEMENT ─────────────────────────────────────────────────
+        // Use nose tip (pt[30]) relative to a baseline captured at first frame
+        const nosePt = pts[30];
         if (!livenessRef.current.headMovementDetected) {
-          if (prevNosePos.current !== null) {
-            const dx = Math.abs(noseTip.x - prevNosePos.current.x);
-            const dy = Math.abs(noseTip.y - prevNosePos.current.y);
-            if (dx > 4 || dy > 4) headFrames.current++;
-            else headFrames.current = Math.max(0, headFrames.current - 1);
-            if (headFrames.current >= 3) {
+          if (!noseBaseline.current) {
+            noseBaseline.current = { x: nosePt.x, y: nosePt.y };
+          } else {
+            const dx = Math.abs(nosePt.x - noseBaseline.current.x);
+            const dy = Math.abs(nosePt.y - noseBaseline.current.y);
+            if (dx > HEAD_MOVE_PX || dy > HEAD_MOVE_PX) {
               setLiveness(prev => ({ ...prev, headMovementDetected: true }));
             }
           }
-          prevNosePos.current = { x: noseTip.x, y: noseTip.y };
         }
       }
-    } catch {
-      // ignore individual frame errors
-    }
 
-    // ── 4. Skin Texture / Temporal Variation ──────────────────────────────────
-    if (!livenessRef.current.textureVariationDetected) {
-      const video = webcamRef.current?.video;
-      if (video) {
-        const currentPixels = getGrayscalePixels(video, offscreenCanvas.current);
-        if (currentPixels && prevPixels.current) {
-          const mad = pixelMAD(currentPixels, prevPixels.current);
-          if (mad > 1.5) textureFrames.current++;
-          if (textureFrames.current >= 5) {
-            setLiveness(prev => ({ ...prev, textureVariationDetected: true }));
+      // ── 4. SKIN TEXTURE (temporal pixel variance) ──────────────────────────
+      // Run on raw video — no face needed. Measures frame-to-frame variation
+      // which is always present for real video but flat for static photos.
+      if (!livenessRef.current.textureDetected) {
+        const ctx = offCanvas.current.getContext("2d");
+        if (ctx) {
+          offCanvas.current.width  = 48;
+          offCanvas.current.height = 48;
+          ctx.drawImage(video, 0, 0, 48, 48);
+          const imgData = ctx.getImageData(0, 0, 48, 48).data;
+          const gray = new Uint8ClampedArray(48 * 48);
+          for (let i = 0; i < gray.length; i++) {
+            gray[i] = Math.round(0.299 * imgData[i*4] + 0.587 * imgData[i*4+1] + 0.114 * imgData[i*4+2]);
           }
-        }
-        prevPixels.current = currentPixels;
-      }
-    }
 
-    if (monitoringRef.current) {
-      animFrameRef.current = requestAnimationFrame(runMonitorFrame);
+          if (prevPixels.current) {
+            let mad = 0;
+            for (let i = 0; i < gray.length; i++) mad += Math.abs(gray[i] - prevPixels.current[i]);
+            mad /= gray.length;
+
+            // Accumulate scores; pass after 4 samples with variation > threshold
+            textureScores.current.push(mad);
+            const recentScores = textureScores.current.slice(-6);
+            const passing = recentScores.filter(s => s > 1.2).length;
+            if (passing >= 4) {
+              setLiveness(prev => ({ ...prev, textureDetected: true }));
+            }
+          }
+          prevPixels.current = gray;
+        }
+      }
+
+    } catch (err) {
+      // Silently ignore individual frame errors — next tick will retry
+    } finally {
+      detectionRunning.current = false;
     }
   }, []);
 
-  // ─── Start monitoring ─────────────────────────────────────────────────────────
+  // ─── Check if all liveness passed and auto-verify ─────────────────────────
+  const allPassed = (l: LivenessState) =>
+    l.blinkDetected && l.lipMovementDetected && l.headMovementDetected && l.textureDetected;
+
+  useEffect(() => {
+    if (pageState === "monitoring" && allPassed(liveness)) {
+      stopAll();
+      verifyAndLogin();
+    }
+  }, [liveness, pageState]);
+
+  // ─── Start liveness monitoring ─────────────────────────────────────────────
   const startMonitoring = useCallback(() => {
     if (!email.trim()) {
-      toast({ variant: "destructive", title: "Email required", description: "Please enter your email address." });
+      toast({ variant: "destructive", title: "Email required", description: "Enter your email first." });
       return;
     }
-    monitoringRef.current = true;
+    monitoringActive.current = true;
     setPageState("monitoring");
-    setTimeLeft(LIVENESS_TIMEOUT_MS / 1000);
+    setTimeLeft(LIVENESS_TIMEOUT_S);
 
-    // Countdown timer
-    timerRef.current = setInterval(() => {
+    // Countdown — 1 tick per second
+    countdownInterval.current = setInterval(() => {
       setTimeLeft(prev => {
         if (prev <= 1) {
-          if (timerRef.current) clearInterval(timerRef.current);
-          monitoringRef.current = false;
-          cancelAnimationFrame(animFrameRef.current);
-          if (!allLivenessPassed(livenessRef.current)) {
-            setErrorMessage("Time's up! Liveness check failed. Please try again.");
+          stopAll();
+          if (!allPassed(livenessRef.current)) {
+            setErrorMsg("Time expired. Not all liveness checks were completed. Please try again.");
             setPageState("failed");
           }
           return 0;
@@ -289,94 +307,78 @@ export default function Login() {
       });
     }, 1000);
 
-    animFrameRef.current = requestAnimationFrame(runMonitorFrame);
-  }, [email, runMonitorFrame, toast]);
+    // Face detection — every 350ms (much gentler on CPU than rAF)
+    detectionInterval.current = setInterval(runDetectionTick, DETECTION_INTERVAL_MS);
 
-  // Auto-verify when all checks pass
-  useEffect(() => {
-    if (allLivenessPassed(liveness) && pageState === "monitoring") {
-      monitoringRef.current = false;
-      cancelAnimationFrame(animFrameRef.current);
-      if (timerRef.current) clearInterval(timerRef.current);
-      verifyLogin();
-    }
-  }, [liveness, pageState]);
+    // Run immediately on the first tick too
+    runDetectionTick();
+  }, [email, runDetectionTick, stopAll, toast]);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      monitoringRef.current = false;
-      cancelAnimationFrame(animFrameRef.current);
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, []);
-
-  // ─── Capture and verify ───────────────────────────────────────────────────────
-  const verifyLogin = useCallback(async () => {
+  // ─── Final face capture + backend call ────────────────────────────────────
+  const verifyAndLogin = useCallback(async () => {
     setPageState("verifying");
-
     const video = webcamRef.current?.video;
-    if (!video) {
-      setErrorMessage("Camera not available.");
-      setPageState("failed");
-      return;
-    }
+    if (!video) { setErrorMsg("Camera unavailable."); setPageState("failed"); return; }
 
     try {
-      const detection = await faceapi
+      // Now we DO need the descriptor for matching — run the full pipeline once
+      const det = await faceapi
         .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
         .withFaceLandmarks()
         .withFaceDescriptor();
 
-      if (!detection) {
-        setErrorMessage("No face detected during verification. Please try again.");
+      if (!det) {
+        setErrorMsg("No face detected at verification time. Please try again.");
         setPageState("failed");
         return;
       }
 
-      const descriptor = Array.from(detection.descriptor);
-
-      const response = await fetch("/api/login-face", {
+      const res = await fetch("/api/login-face", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           email,
-          face_descriptor: descriptor,
+          face_descriptor: Array.from(det.descriptor),
           liveness_passed: true,
         }),
       });
+      const data = await res.json();
 
-      const data = await response.json();
-
-      if (response.ok) {
+      if (res.ok) {
         setConfidence(data.confidence ?? null);
-        setSuccessMessage(data.message || "Login successful!");
+        setSuccessMsg(data.message || "Login successful!");
         setPageState("success");
       } else {
-        setErrorMessage(data.error || "Authentication failed.");
+        setErrorMsg(data.error || "Authentication failed.");
         setPageState("failed");
       }
-    } catch (err: any) {
-      console.error("Login error:", err);
-      setErrorMessage("Network error. Please check your connection.");
+    } catch {
+      setErrorMsg("Network error. Please check your connection.");
       setPageState("failed");
     }
   }, [email]);
 
-  // ─── Liveness check items ─────────────────────────────────────────────────────
-  const checks = [
-    { key: "blinkDetected", label: "Eye Blink", icon: Eye, hint: "Blink naturally" },
-    { key: "lipMovementDetected", label: "Lip Movement", icon: Smile, hint: "Open/close mouth slightly" },
-    { key: "headMovementDetected", label: "Head Movement", icon: Move, hint: "Gently tilt head" },
-    { key: "textureVariationDetected", label: "Real Skin Texture", icon: Layers, hint: "Stay in frame" },
-  ] as const;
+  // ─── Cleanup on unmount ───────────────────────────────────────────────────
+  useEffect(() => () => stopAll(), [stopAll]);
 
+  // ─── Derived values ───────────────────────────────────────────────────────
   const passedCount = Object.values(liveness).filter(Boolean).length;
 
-  // ─── Render ───────────────────────────────────────────────────────────────────
+  // Active instruction: first uncompleted check
+  const activeInstruction = pageState === "monitoring"
+    ? INSTRUCTIONS.find(i => !liveness[i.key as keyof LivenessState])?.text ?? "✅ All checks done!"
+    : null;
+
+  const checks = [
+    { key: "blinkDetected"       as const, label: "Eye Blink",        icon: Eye,    hint: "Please blink your eyes" },
+    { key: "lipMovementDetected" as const, label: "Lip Movement",     icon: Smile,  hint: "Open and close your mouth" },
+    { key: "headMovementDetected"as const, label: "Head Movement",    icon: Move,   hint: "Move your head slightly" },
+    { key: "textureDetected"     as const, label: "Real Skin Texture",icon: Layers, hint: "Hold still in frame" },
+  ];
+
+  // ─── Render ───────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen flex flex-col relative overflow-hidden bg-background">
-      {/* Background glow */}
       <div className="fixed inset-0 z-0 pointer-events-none">
         <div className="absolute top-[5%] left-[5%] w-[45%] h-[45%] rounded-full bg-indigo-600/5 blur-[120px]" />
         <div className="absolute bottom-[5%] right-[5%] w-[40%] h-[40%] rounded-full bg-purple-600/5 blur-[100px]" />
@@ -384,31 +386,33 @@ export default function Login() {
 
       <Navbar />
 
-      <main className="flex-1 container mx-auto px-4 py-24 md:py-28 relative z-10 flex items-start justify-center">
-        <div className="w-full max-w-6xl">
+      <main className="flex-1 container mx-auto px-4 py-24 md:py-28 relative z-10">
+        <div className="w-full max-w-6xl mx-auto">
 
-          {/* ── Header ───────────────────────────────────────────────────── */}
+          {/* Header */}
           <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="text-center mb-10">
             <h1 className="text-4xl md:text-5xl font-display font-bold text-white mb-3">
-              Biometric <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Login</span>
+              Biometric{" "}
+              <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
+                Login
+              </span>
             </h1>
             <p className="text-muted-foreground max-w-xl mx-auto">
-              Complete liveness detection to securely access your account. The system verifies you're a real person in real-time.
+              The system verifies you're a real person using four liveness signals before granting access.
             </p>
           </motion.div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
 
-            {/* ── Left: Camera + Controls ───────────────────────────────── */}
-            <motion.div initial={{ opacity: 0, x: -30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1 }} className="flex flex-col gap-5">
+            {/* ── LEFT: Camera ─────────────────────────────────────────────── */}
+            <motion.div initial={{ opacity: 0, x: -30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1 }} className="flex flex-col gap-4">
 
-              {/* Camera panel */}
-              <div className="glass-panel rounded-3xl overflow-hidden border-white/10 relative bg-black/60">
-                <div className="absolute inset-0 z-10 pointer-events-none opacity-10 bg-[linear-gradient(rgba(255,255,255,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.08)_1px,transparent_1px)] bg-[size:24px_24px]" />
-
+              {/* Camera box */}
+              <div className="glass-panel rounded-3xl overflow-hidden border-white/10 bg-black/60 relative">
                 <div className="aspect-[4/3] relative">
-                  {/* Webcam feed — always mounted after models load */}
-                  {(pageState === "camera-ready" || pageState === "monitoring" || pageState === "verifying" || pageState === "success") && (
+
+                  {/* Webcam — mounted whenever camera is needed */}
+                  {["camera-ready","monitoring","verifying","success"].includes(pageState) && (
                     <Webcam
                       audio={false}
                       ref={webcamRef}
@@ -419,53 +423,70 @@ export default function Login() {
                     />
                   )}
 
-                  {/* Idle / loading overlay */}
-                  {(pageState === "idle" || pageState === "loading-models") && (
+                  {/* Idle / loading */}
+                  {["idle","loading-models"].includes(pageState) && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/90 z-20">
                       {pageState === "loading-models" ? (
                         <>
                           <Loader2 className="w-10 h-10 text-indigo-400 animate-spin mb-4" />
-                          <p className="text-indigo-300 font-medium tracking-widest text-sm uppercase">Initialising Neural Networks</p>
+                          <p className="text-indigo-300 text-sm tracking-widest uppercase font-medium">
+                            Loading Neural Networks…
+                          </p>
                         </>
                       ) : (
                         <>
                           <div className="w-20 h-20 rounded-full bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center mb-4">
                             <User className="w-10 h-10 text-indigo-400" />
                           </div>
-                          <p className="text-white/60 text-sm">Camera will start after model load</p>
+                          <p className="text-white/50 text-sm">Camera starts after model load</p>
                         </>
                       )}
                     </div>
                   )}
 
-                  {/* Face scan overlay during monitoring */}
+                  {/* Monitoring overlay */}
                   {pageState === "monitoring" && (
-                    <div className="absolute inset-0 z-20 pointer-events-none flex items-center justify-center">
-                      <div className="w-44 h-60 border-2 border-indigo-400/40 rounded-[40px] relative">
-                        <div className="absolute -top-1 -left-1 w-5 h-5 border-t-2 border-l-2 border-indigo-400" />
-                        <div className="absolute -top-1 -right-1 w-5 h-5 border-t-2 border-r-2 border-indigo-400" />
-                        <div className="absolute -bottom-1 -left-1 w-5 h-5 border-b-2 border-l-2 border-indigo-400" />
-                        <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-2 border-r-2 border-indigo-400" />
-                        {/* Animated scan beam */}
-                        <motion.div
-                          animate={{ top: ["0%", "100%", "0%"] }}
-                          transition={{ duration: 2.5, repeat: Infinity, ease: "linear" }}
-                          className="absolute left-0 w-full h-0.5 bg-gradient-to-r from-transparent via-indigo-400 to-transparent shadow-[0_0_12px_#818cf8]"
-                        />
+                    <div className="absolute inset-0 z-20 pointer-events-none">
+                      {/* Face frame */}
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <div className="w-44 h-60 border-2 border-indigo-400/40 rounded-[40px] relative">
+                          <div className="absolute -top-1 -left-1  w-5 h-5 border-t-2 border-l-2 border-indigo-400" />
+                          <div className="absolute -top-1 -right-1 w-5 h-5 border-t-2 border-r-2 border-indigo-400" />
+                          <div className="absolute -bottom-1 -left-1  w-5 h-5 border-b-2 border-l-2 border-indigo-400" />
+                          <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-2 border-r-2 border-indigo-400" />
+                          <motion.div
+                            animate={{ top: ["0%","100%","0%"] }}
+                            transition={{ duration: 2.5, repeat: Infinity, ease: "linear" }}
+                            className="absolute left-0 w-full h-0.5 bg-gradient-to-r from-transparent via-indigo-400 to-transparent shadow-[0_0_12px_#818cf8]"
+                          />
+                        </div>
                       </div>
+                      {/* Instruction banner at bottom */}
+                      {activeInstruction && (
+                        <div className="absolute bottom-14 left-4 right-4 flex justify-center">
+                          <motion.div
+                            key={activeInstruction}
+                            initial={{ opacity: 0, y: 6 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className="px-4 py-2 rounded-full bg-indigo-600/80 backdrop-blur-sm text-white text-sm font-medium shadow-lg"
+                          >
+                            {activeInstruction}
+                          </motion.div>
+                        </div>
+                      )}
                     </div>
                   )}
 
-                  {/* Verifying overlay */}
+                  {/* Verifying */}
                   {pageState === "verifying" && (
                     <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm">
                       <Loader2 className="w-12 h-12 text-indigo-400 animate-spin mb-3" />
                       <p className="text-white font-semibold">Verifying identity…</p>
-                      <p className="text-indigo-300 text-sm mt-1">Comparing face against database</p>
+                      <p className="text-indigo-300 text-sm mt-1">Matching face against database</p>
                     </div>
                   )}
 
-                  {/* Success overlay */}
+                  {/* Success */}
                   {pageState === "success" && (
                     <motion.div
                       initial={{ opacity: 0 }} animate={{ opacity: 1 }}
@@ -480,28 +501,32 @@ export default function Login() {
                       </motion.div>
                       <h3 className="text-2xl font-bold text-white">Access Granted</h3>
                       {confidence !== null && (
-                        <p className="text-green-400 text-sm mt-1">Confidence: {confidence}%</p>
+                        <p className="text-green-400 text-sm mt-1">Match confidence: {confidence}%</p>
                       )}
                     </motion.div>
                   )}
 
-                  {/* Failed overlay */}
+                  {/* Failed */}
                   {pageState === "failed" && (
                     <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80">
                       <ShieldX className="w-12 h-12 text-red-400 mb-3" />
-                      <p className="text-white font-semibold text-center px-6">{errorMessage || "Authentication Failed"}</p>
+                      <p className="text-white font-semibold text-center px-8">{errorMsg || "Authentication Failed"}</p>
                     </div>
                   )}
 
-                  {/* Top bar: LIVE badge + timer */}
-                  {(pageState === "monitoring" || pageState === "camera-ready") && (
+                  {/* Top bar: LIVE + timer */}
+                  {["camera-ready","monitoring"].includes(pageState) && (
                     <div className="absolute top-4 left-4 right-4 z-30 flex items-center justify-between">
                       <div className="flex items-center gap-2 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-full border border-white/10">
                         <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
                         <span className="text-xs font-mono text-white/80 uppercase">Live</span>
                       </div>
                       {pageState === "monitoring" && (
-                        <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-mono font-bold ${timeLeft <= 5 ? "bg-red-900/60 border-red-500/50 text-red-300" : "bg-black/60 border-white/10 text-indigo-300"}`}>
+                        <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-mono font-bold ${
+                          timeLeft <= 7
+                            ? "bg-red-900/60 border-red-500/50 text-red-300"
+                            : "bg-black/60 border-white/10 text-indigo-300"
+                        }`}>
                           <Timer className="w-3.5 h-3.5" />
                           {timeLeft}s
                         </div>
@@ -509,14 +534,14 @@ export default function Login() {
                     </div>
                   )}
 
-                  {/* Progress bar at bottom during monitoring */}
+                  {/* Progress bar */}
                   {pageState === "monitoring" && (
                     <div className="absolute bottom-0 left-0 right-0 z-30">
-                      <div className="h-1 bg-white/10">
+                      <div className="h-1.5 bg-white/10">
                         <motion.div
+                          animate={{ width: `${(passedCount / 4) * 100}%` }}
+                          transition={{ duration: 0.4 }}
                           className="h-full bg-gradient-to-r from-indigo-500 to-purple-500"
-                          style={{ width: `${(passedCount / 4) * 100}%` }}
-                          transition={{ duration: 0.3 }}
                         />
                       </div>
                     </div>
@@ -525,7 +550,7 @@ export default function Login() {
               </div>
 
               {/* Email input */}
-              {(pageState === "idle" || pageState === "camera-ready" || pageState === "loading-models") && (
+              {["idle","camera-ready","loading-models"].includes(pageState) && (
                 <div className="space-y-2">
                   <label className="text-sm font-medium text-gray-300 ml-1">Email Address</label>
                   <div className="relative">
@@ -534,9 +559,9 @@ export default function Login() {
                     </div>
                     <input
                       type="email"
-                      required
                       value={email}
-                      onChange={(e) => setEmail(e.target.value)}
+                      onChange={e => setEmail(e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && pageState === "camera-ready" && startMonitoring()}
                       className="w-full pl-11 pr-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
                       placeholder="you@example.com"
                     />
@@ -545,66 +570,94 @@ export default function Login() {
               )}
 
               {/* Action buttons */}
-              <div className="flex flex-col gap-3">
-                {pageState === "idle" && (
-                  <button
-                    onClick={loadModels}
-                    disabled={!email.trim()}
-                    className="w-full py-4 px-6 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 flex items-center justify-center gap-2"
-                  >
-                    <Eye className="w-5 h-5" />
-                    Start Camera & Load AI
-                  </button>
-                )}
+              {pageState === "idle" && (
+                <button
+                  onClick={loadModels}
+                  disabled={!email.trim()}
+                  className="w-full py-4 px-6 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-40 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 transition-all flex items-center justify-center gap-2"
+                >
+                  <Eye className="w-5 h-5" />
+                  Start Camera & Load AI
+                </button>
+              )}
 
-                {pageState === "camera-ready" && (
-                  <button
-                    onClick={startMonitoring}
-                    className="w-full py-4 px-6 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 flex items-center justify-center gap-2 group"
-                  >
-                    <Zap className="w-5 h-5" />
-                    Begin Liveness Verification
-                    <ChevronRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
-                  </button>
-                )}
+              {pageState === "camera-ready" && (
+                <button
+                  onClick={startMonitoring}
+                  className="w-full py-4 px-6 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] hover:-translate-y-0.5 active:translate-y-0 transition-all flex items-center justify-center gap-2 group"
+                >
+                  <Zap className="w-5 h-5" />
+                  Begin Liveness Verification
+                  <ChevronRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
+                </button>
+              )}
 
-                {pageState === "monitoring" && (
-                  <div className="text-center text-indigo-300 text-sm font-medium py-3 bg-indigo-500/10 rounded-xl border border-indigo-500/20">
-                    Analysing live feed… Follow the prompts on the right →
+              {pageState === "monitoring" && (
+                <div className="py-3 text-center text-indigo-300 text-sm font-medium bg-indigo-500/10 rounded-xl border border-indigo-500/20">
+                  Follow the on-screen prompts →
+                </div>
+              )}
+
+              {pageState === "failed" && (
+                <button
+                  onClick={resetLiveness}
+                  className="w-full py-4 px-6 rounded-xl font-bold text-white bg-white/10 hover:bg-white/15 border border-white/15 hover:-translate-y-0.5 transition-all flex items-center justify-center gap-2"
+                >
+                  <RefreshCw className="w-5 h-5" />
+                  Try Again
+                </button>
+              )}
+
+              {pageState === "success" && successMsg && (
+                <div className="py-4 rounded-xl bg-green-500/10 border border-green-500/30 text-green-300 text-center font-semibold">
+                  {successMsg}
+                </div>
+              )}
+
+              {/* Debug panel (only during monitoring) */}
+              {pageState === "monitoring" && (debugEAR !== null || debugLip !== null) && (
+                <div className="p-4 rounded-xl bg-black/40 border border-white/5 text-xs font-mono space-y-1">
+                  <div className="flex items-center gap-2 text-indigo-300 mb-2">
+                    <Activity className="w-3.5 h-3.5" />
+                    <span className="font-semibold uppercase tracking-wider">Live Sensor Readout</span>
                   </div>
-                )}
-
-                {(pageState === "failed") && (
-                  <button
-                    onClick={resetLiveness}
-                    className="w-full py-4 px-6 rounded-xl font-bold text-white bg-white/10 hover:bg-white/15 border border-white/15 hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 flex items-center justify-center gap-2"
-                  >
-                    <RefreshCw className="w-5 h-5" />
-                    Try Again
-                  </button>
-                )}
-
-                {pageState === "success" && (
-                  <div className="py-4 rounded-xl bg-green-500/10 border border-green-500/30 text-green-300 text-center font-semibold">
-                    {successMessage}
-                  </div>
-                )}
-              </div>
+                  {debugEAR !== null && (
+                    <div className="flex justify-between text-gray-400">
+                      <span>Eye Aspect Ratio (EAR)</span>
+                      <span className={debugEAR < EAR_BLINK_CLOSED ? "text-yellow-400" : "text-green-400"}>
+                        {debugEAR.toFixed(3)}
+                        {debugEAR < EAR_BLINK_CLOSED && " ← blink!"}
+                      </span>
+                    </div>
+                  )}
+                  {debugLip !== null && (
+                    <div className="flex justify-between text-gray-400">
+                      <span>Lip Gap (px)</span>
+                      <span className={debugLip > LIP_OPEN_PX ? "text-yellow-400" : "text-gray-500"}>
+                        {debugLip}px
+                        {debugLip > LIP_OPEN_PX && " ← open"}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </motion.div>
 
-            {/* ── Right: Liveness checks panel ──────────────────────────── */}
+            {/* ── RIGHT: Checks + Instructions ─────────────────────────────── */}
             <motion.div initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.2 }} className="flex flex-col gap-5">
 
-              {/* Check list */}
+              {/* Liveness check cards */}
               <div className="glass-panel rounded-3xl p-6 md:p-8 border-white/10">
                 <div className="flex items-center justify-between mb-6">
                   <h2 className="text-xl font-bold text-white">Liveness Detection</h2>
-                  <span className="text-sm text-indigo-400 font-medium">{passedCount}/4 passed</span>
+                  <span className="text-sm text-indigo-400 font-medium">{passedCount} / 4 passed</span>
                 </div>
 
-                <div className="space-y-4">
+                <div className="space-y-3">
                   {checks.map(({ key, label, icon: Icon, hint }) => {
                     const passed = liveness[key];
+                    const isActive = pageState === "monitoring" && !passed
+                      && INSTRUCTIONS.findIndex(i => !liveness[i.key as keyof LivenessState]) === checks.indexOf({ key, label, icon: Icon, hint });
                     return (
                       <motion.div
                         key={key}
@@ -613,31 +666,32 @@ export default function Login() {
                         className={`flex items-center gap-4 p-4 rounded-2xl border transition-all duration-300 ${
                           passed
                             ? "bg-green-500/10 border-green-500/30"
-                            : pageState === "monitoring"
-                            ? "bg-indigo-500/5 border-indigo-500/20 animate-pulse"
+                            : isActive
+                            ? "bg-indigo-500/10 border-indigo-500/30"
                             : "bg-white/3 border-white/8"
                         }`}
                       >
-                        <div className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors duration-300 ${passed ? "bg-green-500/20" : "bg-white/5"}`}>
-                          <Icon className={`w-5 h-5 ${passed ? "text-green-400" : "text-gray-400"}`} />
+                        <div className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors ${
+                          passed ? "bg-green-500/20" : isActive ? "bg-indigo-500/15" : "bg-white/5"
+                        }`}>
+                          <Icon className={`w-5 h-5 ${passed ? "text-green-400" : isActive ? "text-indigo-300" : "text-gray-400"}`} />
                         </div>
-                        <div className="flex-1">
-                          <p className={`font-semibold text-sm ${passed ? "text-green-300" : "text-white"}`}>{label}</p>
-                          {!passed && pageState === "monitoring" && (
-                            <p className="text-xs text-indigo-400 mt-0.5">{hint}</p>
-                          )}
-                          {passed && (
-                            <p className="text-xs text-green-500/80 mt-0.5">Verified ✓</p>
-                          )}
+                        <div className="flex-1 min-w-0">
+                          <p className={`font-semibold text-sm ${passed ? "text-green-300" : isActive ? "text-indigo-200" : "text-white"}`}>
+                            {label}
+                          </p>
+                          <p className={`text-xs mt-0.5 ${passed ? "text-green-500/70" : isActive ? "text-indigo-400" : "text-gray-500"}`}>
+                            {passed ? "Verified ✓" : isActive ? hint : "Pending"}
+                          </p>
                         </div>
                         <AnimatePresence mode="wait">
                           {passed ? (
                             <motion.div key="check" initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: "spring", bounce: 0.6 }}>
-                              <CheckCircle2 className="w-6 h-6 text-green-400" />
+                              <CheckCircle2 className="w-6 h-6 text-green-400 flex-shrink-0" />
                             </motion.div>
                           ) : (
-                            <motion.div key="circle" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-                              <div className={`w-6 h-6 rounded-full border-2 ${pageState === "monitoring" ? "border-indigo-500/50" : "border-white/20"}`} />
+                            <motion.div key="ring" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex-shrink-0">
+                              <div className={`w-6 h-6 rounded-full border-2 ${isActive ? "border-indigo-400 animate-pulse" : "border-white/20"}`} />
                             </motion.div>
                           )}
                         </AnimatePresence>
@@ -646,46 +700,48 @@ export default function Login() {
                   })}
                 </div>
 
-                {/* Overall status bar */}
+                {/* Overall progress */}
                 <div className="mt-6">
-                  <div className="flex items-center justify-between text-xs text-gray-400 mb-2">
+                  <div className="flex justify-between text-xs text-gray-400 mb-2">
                     <span>Overall Progress</span>
                     <span>{Math.round((passedCount / 4) * 100)}%</span>
                   </div>
                   <div className="h-2 rounded-full bg-white/5 overflow-hidden">
                     <motion.div
-                      className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-purple-500"
                       animate={{ width: `${(passedCount / 4) * 100}%` }}
                       transition={{ duration: 0.5, ease: "easeOut" }}
+                      className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-purple-500"
                     />
                   </div>
                 </div>
               </div>
 
-              {/* Instructions / How it works */}
+              {/* Instructions */}
               <div className="glass-panel rounded-3xl p-6 border-white/10">
                 <h3 className="text-base font-bold text-white mb-4 flex items-center gap-2">
                   <AlertTriangle className="w-4 h-4 text-yellow-400" />
-                  Anti-Spoof Instructions
+                  How to Complete Liveness Check
                 </h3>
                 <ul className="space-y-3">
                   {[
-                    "Position your face inside the detection frame",
-                    "Blink naturally at least once",
-                    "Open and close your mouth slightly",
-                    "Gently turn your head left or right",
-                    "Ensure good lighting, no glasses if possible",
-                    "Complete all checks within the time limit",
+                    "Position your face inside the scan frame",
+                    "Blink your eyes naturally (close fully, then open)",
+                    "Open your mouth, then close it",
+                    "Gently tilt or turn your head left or right",
+                    "Stay in frame — skin texture is verified automatically",
+                    "Good lighting helps — avoid backlighting",
                   ].map((tip, i) => (
                     <li key={i} className="flex items-start gap-3 text-sm text-gray-400">
-                      <span className="flex-shrink-0 w-5 h-5 rounded-full bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-xs text-indigo-400 font-bold">{i + 1}</span>
+                      <span className="flex-shrink-0 w-5 h-5 rounded-full bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-xs text-indigo-400 font-bold">
+                        {i + 1}
+                      </span>
                       {tip}
                     </li>
                   ))}
                 </ul>
               </div>
 
-              {/* Confidence score on success */}
+              {/* Confidence on success */}
               {pageState === "success" && confidence !== null && (
                 <motion.div
                   initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
@@ -693,7 +749,9 @@ export default function Login() {
                 >
                   <h3 className="text-base font-bold text-green-300 mb-3">Authentication Score</h3>
                   <div className="flex items-center gap-4">
-                    <div className="text-5xl font-bold text-white">{confidence}<span className="text-xl text-green-400">%</span></div>
+                    <div className="text-5xl font-bold text-white">
+                      {confidence}<span className="text-xl text-green-400">%</span>
+                    </div>
                     <div className="flex-1">
                       <div className="h-3 rounded-full bg-white/5 overflow-hidden">
                         <motion.div
@@ -703,13 +761,13 @@ export default function Login() {
                           className="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400"
                         />
                       </div>
-                      <p className="text-xs text-green-400/70 mt-1.5">Face match confidence</p>
+                      <p className="text-xs text-green-400/70 mt-1.5">Face descriptor match confidence</p>
                     </div>
                   </div>
                 </motion.div>
               )}
 
-              {/* Spoof failure message */}
+              {/* Failure panel */}
               {pageState === "failed" && (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
@@ -719,7 +777,9 @@ export default function Login() {
                     <XCircle className="w-6 h-6 text-red-400 flex-shrink-0 mt-0.5" />
                     <div>
                       <h3 className="text-base font-bold text-red-300 mb-1">Authentication Failed</h3>
-                      <p className="text-sm text-gray-400">{errorMessage || "Liveness check failed. Possible spoof detected."}</p>
+                      <p className="text-sm text-gray-400">
+                        {errorMsg || "Liveness check failed. Possible spoof detected."}
+                      </p>
                     </div>
                   </div>
                 </motion.div>

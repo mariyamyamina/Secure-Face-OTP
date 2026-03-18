@@ -1,0 +1,101 @@
+Improve the performance and accuracy of the Login and Anti-Spoof (Liveness Detection) module in my React face authentication system.
+
+=====================================
+CURRENT ISSUES
+=====================================
+
+1. Login process is very slow
+2. Eye blink detection is not working properly
+3. Lip movement detection is not being detected
+4. Overall liveness detection is unreliable
+
+=====================================
+GOAL
+=====================================
+
+- Make face detection and login FAST
+- Ensure accurate detection of:
+  - Eye blink
+  - Lip movement
+  - Head movement
+
+=====================================
+FRONTEND FIXES (React + face-api.js)
+=====================================
+
+1. Optimize Face Detection:
+
+   - Use TinyFaceDetector with optimized settings:
+     inputSize: 224
+     scoreThreshold: 0.5
+
+   - Do NOT run detection on every frame
+   - Use setInterval (every 300ms–500ms) instead of continuous loop
+
+-------------------------------------
+
+2. Improve Eye Blink Detection:
+
+   - Use Eye Aspect Ratio (EAR) calculation
+   - Track eye landmarks (leftEye, rightEye)
+   - Detect blink when EAR drops below threshold (e.g., 0.2) and rises again
+   - Maintain state:
+     blinkDetected = true after 1 valid blink
+
+-------------------------------------
+
+3. Improve Lip Movement Detection:
+
+   - Track mouth landmarks
+   - Calculate distance between upper and lower lips
+   - Detect opening and closing pattern
+   - Set:
+     lipMovementDetected = true after movement
+
+-------------------------------------
+
+4. Improve Head Movement Detection:
+
+   - Track nose or center landmark position
+   - Compare X/Y position across frames
+   - Detect slight movement left/right or up/down
+
+-------------------------------------
+
+5. Fix Performance Issues:
+
+   - Load face-api models ONLY once using useEffect
+   - Avoid reloading models on every render
+   - Stop webcam processing after successful detection
+   - Use requestAnimationFrame OR controlled interval
+
+-------------------------------------
+
+6. Add Debug UI:
+
+   - Show live indicators:
+     - Blink: Detected / Not Detected
+     - Lip Movement: Detected / Not Detected
+     - Head Movement: Detected / Not Detected
+
+-------------------------------------
+
+7. Improve User Guidance:
+
+   - Show instructions:
+     "Please blink your eyes"
+     "Move your head slightly"
+     "Open and close your mouth"
+
+-------------------------------------
+
+=====================================
+EXPECTED OUTPUT
+=====================================
+
+- Faster login experience
+- Reliable blink detection
+- Working lip movement detection
+- Working head movement detection
+- Clean and optimized React code
+- Proper state management using hooks
