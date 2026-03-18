@@ -1,0 +1,197 @@
+Build an advanced Login and Anti-Spoof Face Authentication module for an "Intelligent Anti-Spoof Face Authentication System with Dynamic OTP Validation".
+
+Tech Stack:
+- Frontend: React (TypeScript)
+- Backend: FastAPI (Python)
+- Database: MySQL
+
+=====================================
+FRONTEND REQUIREMENTS (React)
+=====================================
+
+1. Create a Login Page:
+
+   Fields:
+   - Email input
+   - "Start Camera" button
+   - Live webcam preview
+   - "Verify & Login" button
+
+-------------------------------------
+
+2. Integrate face-api.js:
+
+   Load models:
+   - TinyFaceDetector
+   - FaceLandmark68Net
+   - FaceRecognitionNet
+
+-------------------------------------
+
+3. Real-Time Face Monitoring:
+
+   Continuously analyze webcam stream for:
+
+   A. Eye Blink Detection:
+      - Track eye landmarks
+      - Calculate Eye Aspect Ratio (EAR)
+      - Detect at least 1–2 blinks
+
+   B. Lip Movement Detection:
+      - Track mouth landmarks
+      - Detect open/close movement
+
+   C. Head Movement Detection:
+      - Detect slight left/right or up/down movement
+      - Compare landmark position changes over frames
+
+   D. Skin Texture Check (Basic):
+      - Ensure real-time variation in pixel intensity
+      - Reject static images (photo attacks)
+
+-------------------------------------
+
+4. Liveness Validation:
+
+   Allow login ONLY if:
+   - Blink detected ✅
+   - Lip movement detected ✅
+   - Head movement detected ✅
+   - Texture variation present ✅
+
+   Otherwise:
+   Show error: "Liveness check failed. Possible spoof detected."
+
+-------------------------------------
+
+5. On "Verify & Login":
+
+   - Capture face
+   - Extract face descriptor (128D vector)
+
+-------------------------------------
+
+6. Send API request:
+
+   POST ${VITE_API_BASE_URL}/login-face
+
+   Payload:
+   {
+     email: string,
+     face_descriptor: string (JSON),
+     liveness_passed: true
+   }
+
+-------------------------------------
+
+7. UI Features:
+
+   - Show live status indicators:
+     - Blink detected ✔
+     - Head movement ✔
+     - Lip movement ✔
+   - Show loading spinner
+   - Show success or failure message
+
+-------------------------------------
+
+=====================================
+BACKEND REQUIREMENTS (FastAPI)
+=====================================
+
+1. Create endpoint:
+   POST /login-face
+
+-------------------------------------
+
+2. Receive:
+   - email
+   - face_descriptor
+   - liveness_passed
+
+-------------------------------------
+
+3. Validation:
+
+   - If liveness_passed is false:
+       return { error: "Liveness verification failed" }
+
+-------------------------------------
+
+4. Face Matching:
+
+   - Retrieve stored descriptor from MySQL
+   - Convert JSON → array
+
+   Compute Euclidean distance:
+   distance = sqrt(sum((a - b)^2))
+
+   If distance < 0.5:
+       match = True
+   else:
+       match = False
+
+-------------------------------------
+
+5. Response:
+
+   If match:
+       return { message: "Login successful" }
+
+   Else:
+       return { error: "Face does not match" }
+
+-------------------------------------
+
+=====================================
+DATABASE
+=====================================
+
+Table: users
+- id
+- email
+- password
+- face_descriptor
+
+-------------------------------------
+
+=====================================
+CODE STRUCTURE
+=====================================
+
+- routes/auth.py → login endpoint
+- utils/ → face comparison logic
+- frontend → liveness detection logic
+
+-------------------------------------
+
+=====================================
+IMPORTANT NOTES
+=====================================
+
+- Perform liveness detection ONLY on frontend
+- Backend trusts liveness flag but can be extended later
+- Use JSON.stringify() for descriptor
+- Use Axios for API calls
+
+-------------------------------------
+
+=====================================
+BONUS (OPTIONAL)
+=====================================
+
+- Add timer (user must complete liveness in 5 seconds)
+- Add retry option
+- Show confidence score
+- Add OTP step after successful login
+
+-------------------------------------
+
+=====================================
+OUTPUT
+=====================================
+
+- Complete React Login Page
+- Liveness detection logic
+- Backend API for login
+- Clean and modular code

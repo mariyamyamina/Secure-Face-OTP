@@ -30,17 +30,24 @@ export const RegisterFaceBody = zod.object({
 });
 
 /**
- * Authenticate a user by matching their face descriptor
- * @summary Login with face verification
+ * Authenticate a user by matching their face descriptor with liveness validation
+ * @summary Login with face verification and liveness check
  */
 export const LoginFaceBody = zod.object({
   email: zod.string().email(),
   face_descriptor: zod
     .array(zod.number())
     .describe("128-dimensional face descriptor vector for matching"),
+  liveness_passed: zod
+    .boolean()
+    .describe("Whether the frontend liveness detection passed"),
 });
 
 export const LoginFaceResponse = zod.object({
   message: zod.string(),
   matched: zod.boolean(),
+  confidence: zod
+    .number()
+    .optional()
+    .describe("Confidence score (0-100), higher is better"),
 });

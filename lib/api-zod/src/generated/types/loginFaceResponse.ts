@@ -9,4 +9,6 @@
 export interface LoginFaceResponse {
   message: string;
   matched: boolean;
+  /** Confidence score (0-100), higher is better */
+  confidence?: number;
 }

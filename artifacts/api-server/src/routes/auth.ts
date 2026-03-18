@@ -65,7 +65,7 @@ router.post("/register-face", async (req, res) => {
   }
 });
 
-// POST /api/login-face - Authenticate user with face descriptor
+// POST /api/login-face - Authenticate user with face descriptor + liveness check
 router.post("/login-face", async (req, res) => {
   const parsed = LoginFaceBody.safeParse(req.body);
   if (!parsed.success) {
@@ -76,7 +76,13 @@ router.post("/login-face", async (req, res) => {
     return;
   }
 
-  const { email, face_descriptor } = parsed.data;
+  const { email, face_descriptor, liveness_passed } = parsed.data;
+
+  // Reject immediately if liveness check did not pass on frontend
+  if (!liveness_passed) {
+    res.status(401).json({ error: "Liveness verification failed" });
+    return;
+  }
 
   try {
     // Look up user by email
@@ -94,18 +100,29 @@ router.post("/login-face", async (req, res) => {
     const user = users[0];
     const storedDescriptor: number[] = JSON.parse(user.face_descriptor);
 
-    // Compare face descriptors using euclidean distance
-    const distance = euclideanDistance(face_descriptor, storedDescriptor);
-    const THRESHOLD = 0.6; // Standard face-api.js threshold
-
-    if (distance > THRESHOLD) {
-      res.status(401).json({ error: "Face not recognized" });
+    // Validate descriptor lengths match
+    if (face_descriptor.length !== storedDescriptor.length) {
+      res.status(400).json({ error: "Invalid face descriptor format" });
       return;
     }
 
+    // Compare face descriptors using euclidean distance
+    // Threshold of 0.5 is stricter than the 0.6 used during registration
+    const distance = euclideanDistance(face_descriptor, storedDescriptor);
+    const THRESHOLD = 0.5;
+
+    if (distance > THRESHOLD) {
+      res.status(401).json({ error: "Face does not match" });
+      return;
+    }
+
+    // Compute a confidence score: 100% at distance=0, 0% at distance=0.5
+    const confidence = Math.max(0, Math.round((1 - distance / THRESHOLD) * 100));
+
     res.status(200).json({
-      message: "Face matched successfully. OTP would be sent to email.",
+      message: "Login successful",
       matched: true,
+      confidence,
     });
   } catch (err) {
     console.error("Login error:", err);

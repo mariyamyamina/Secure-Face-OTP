@@ -26,11 +26,15 @@ export interface LoginFaceRequest {
   email: string;
   /** 128-dimensional face descriptor vector for matching */
   face_descriptor: number[];
+  /** Whether the frontend liveness detection passed */
+  liveness_passed: boolean;
 }
 
 export interface LoginFaceResponse {
   message: string;
   matched: boolean;
+  /** Confidence score (0-100), higher is better */
+  confidence?: number;
 }
 
 export interface ErrorResponse {

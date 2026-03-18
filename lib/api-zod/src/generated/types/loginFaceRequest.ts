@@ -10,4 +10,6 @@ export interface LoginFaceRequest {
   email: string;
   /** 128-dimensional face descriptor vector for matching */
   face_descriptor: number[];
+  /** Whether the frontend liveness detection passed */
+  liveness_passed: boolean;
 }

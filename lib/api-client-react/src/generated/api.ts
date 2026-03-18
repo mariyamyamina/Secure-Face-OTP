@@ -198,8 +198,8 @@ export const useRegisterFace = <
 };
 
 /**
- * Authenticate a user by matching their face descriptor
- * @summary Login with face verification
+ * Authenticate a user by matching their face descriptor with liveness validation
+ * @summary Login with face verification and liveness check
  */
 export const getLoginFaceUrl = () => {
   return `/api/login-face`;
@@ -262,7 +262,7 @@ export type LoginFaceMutationBody = BodyType<LoginFaceRequest>;
 export type LoginFaceMutationError = ErrorType<ErrorResponse>;
 
 /**
- * @summary Login with face verification
+ * @summary Login with face verification and liveness check
  */
 export const useLoginFace = <
   TError = ErrorType<ErrorResponse>,
