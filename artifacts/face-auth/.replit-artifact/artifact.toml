@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Intelligent Anti-Spoof Face Authentication System"
+version = "1.0.0"
+id = "artifacts/face-auth"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+localPort = 19434
+name = "web"
+paths = ["/"]
+
+[services.development]
+run = "pnpm --filter @workspace/face-auth run dev"
+
+[services.env]
+PORT = "19434"
+BASE_PATH = "/"
+
+[services.production]
+build = ["pnpm", "--filter", "@workspace/face-auth", "run", "build"]
+publicDir = "artifacts/face-auth/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"

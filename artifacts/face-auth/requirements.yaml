@@ -1,0 +1,16 @@
+packages:
+  "framer-motion": "For smooth page transitions and micro-interactions"
+  "react-webcam": "For capturing user faces during registration and login"
+  "@vladmandic/face-api": "Modern fork of face-api.js for face detection and descriptor extraction"
+  "clsx": "Utility for constructing className strings conditionally"
+  "tailwind-merge": "Utility to safely merge Tailwind CSS classes"
+
+images:
+  - path: "artifacts/face-auth/public/images/hero-bg.png"
+    description: "Abstract dark background with glowing blue and purple holographic gradients, security nodes, and subtle data streams, glassmorphism style, 4k resolution"
+    aspect_ratio: "16:9"
+
+notes:
+  - Using @workspace/api-client-react for TanStack query hooks
+  - Loading face-api models from jsdelivr CDN as requested
+  - Defaulting to a dark mode aesthetic natively

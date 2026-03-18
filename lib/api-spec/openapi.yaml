@@ -1,15 +1,16 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Intelligent Anti-Spoof Face Authentication System API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: auth
+    description: Authentication operations
 paths:
   /healthz:
     get:
@@ -24,6 +25,80 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /register-face:
+    post:
+      operationId: registerFace
+      tags: [auth]
+      summary: Register a user with face descriptor
+      description: Registers a new user with email, password, and face descriptor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterFaceRequest"
+      responses:
+        "201":
+          description: User registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterFaceResponse"
+        "409":
+          description: Email already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "400":
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /login-face:
+    post:
+      operationId: loginFace
+      tags: [auth]
+      summary: Login with face verification
+      description: Authenticate a user by matching their face descriptor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginFaceRequest"
+      responses:
+        "200":
+          description: Face matched, OTP sent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginFaceResponse"
+        "401":
+          description: Face not recognized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +108,64 @@ components:
           type: string
       required:
         - status
-
+    RegisterFaceRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 6
+        face_descriptor:
+          type: array
+          items:
+            type: number
+          description: 128-dimensional face descriptor vector
+      required:
+        - email
+        - password
+        - face_descriptor
+    RegisterFaceResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        userId:
+          type: integer
+      required:
+        - message
+        - userId
+    LoginFaceRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        face_descriptor:
+          type: array
+          items:
+            type: number
+          description: 128-dimensional face descriptor vector for matching
+      required:
+        - email
+        - face_descriptor
+    LoginFaceResponse:
+      type: object
+      properties:
+        message:
+          type: string
+        matched:
+          type: boolean
+      required:
+        - message
+        - matched
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+      required:
+        - error
