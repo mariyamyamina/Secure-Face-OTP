@@ -13,19 +13,20 @@ import { useToast } from "@/hooks/use-toast";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
-const DETECTION_INTERVAL_MS = 350;   // Run detection every 350ms (not every frame)
-const LIVENESS_TIMEOUT_S = 20;       // 20 seconds to complete all checks
+const DETECTION_INTERVAL_MS = 200;   // 200ms — fast enough to catch a 200ms blink
+const LIVENESS_TIMEOUT_S = 25;       // 25 seconds total
 
-// EAR thresholds — these work for most faces under normal lighting
-const EAR_BLINK_CLOSED = 0.20;       // Eyes are considered closed below this
-const EAR_BLINK_OPEN   = 0.26;       // Eyes are considered open above this
+// Blink: relative drop. When EAR falls to ≤75% of the rolling max, it's a blink.
+// Works at any face distance — no fixed absolute threshold needed.
+const BLINK_DROP_RATIO = 0.75;
+const EAR_HISTORY_SIZE = 12;        // Rolling window of recent EAR samples
 
-// Lip openness threshold (pixels, normalised by face size later)
-const LIP_OPEN_PX  = 8;             // Mouth is open if inner lip gap > 8px
-const LIP_CLOSE_PX = 4;             // Mouth is closed if gap < 4px
+// Lip openness threshold (pixels)
+const LIP_OPEN_PX  = 6;             // Mouth open when inner lip gap > 6px
+const LIP_CLOSE_PX = 3;             // Mouth closed when gap < 3px
 
 // Head movement threshold (pixels)
-const HEAD_MOVE_PX = 10;            // Nose must shift >10px from baseline
+const HEAD_MOVE_PX = 8;             // Nose must shift >8px from baseline
 
 // ─── EAR helper ───────────────────────────────────────────────────────────────
 function ptDist(a: faceapi.Point, b: faceapi.Point) {
@@ -99,9 +100,10 @@ export default function Login() {
   // Prevent overlapping async calls inside the interval
   const detectionRunning = useRef(false);
 
-  // ── Blink state machine ──────────────────────────────────────────────────
-  // Two-phase: wait for "closed" then wait for "open"
-  const eyeWasClosed = useRef(false);
+  // ── Blink: rolling EAR history for relative-drop detection ──────────────
+  // We keep the last N EAR values. A blink is when the latest reading drops
+  // to ≤75% of the rolling max (eyes-open baseline). No fixed threshold needed.
+  const earHistory = useRef<number[]>([]);
 
   // ── Lip state machine ────────────────────────────────────────────────────
   // Track whether we've seen both an open and a closed state
@@ -151,7 +153,7 @@ export default function Login() {
     const blank = { blinkDetected: false, lipMovementDetected: false, headMovementDetected: false, textureDetected: false };
     setLiveness(blank);
     livenessRef.current = blank;
-    eyeWasClosed.current = false;
+    earHistory.current   = [];
     lipWasOpen.current   = false;
     lipWasClosed.current = false;
     noseBaseline.current = null;
@@ -192,13 +194,22 @@ export default function Login() {
         setDebugEAR(Math.round(ear * 1000) / 1000);
 
         if (!livenessRef.current.blinkDetected) {
-          if (ear < EAR_BLINK_CLOSED) {
-            // Phase 1: eyes closed
-            eyeWasClosed.current = true;
-          } else if (ear > EAR_BLINK_OPEN && eyeWasClosed.current) {
-            // Phase 2: eyes back open after being closed → blink complete
-            eyeWasClosed.current = false;
-            setLiveness(prev => ({ ...prev, blinkDetected: true }));
+          // Push into rolling history
+          earHistory.current.push(ear);
+          if (earHistory.current.length > EAR_HISTORY_SIZE) earHistory.current.shift();
+
+          // Need at least 4 samples to establish an open-eye baseline
+          if (earHistory.current.length >= 4) {
+            // Rolling max = the highest EAR seen recently (open eyes baseline)
+            const rollingMax = Math.max(...earHistory.current);
+
+            // A blink = current EAR drops to ≤75% of the open-eye baseline.
+            // Require the baseline to be meaningful (> 0.15) to avoid false positives
+            // when no face is present.
+            if (rollingMax > 0.15 && ear <= rollingMax * BLINK_DROP_RATIO) {
+              setLiveness(prev => ({ ...prev, blinkDetected: true }));
+              earHistory.current = []; // reset so it doesn't re-trigger
+            }
           }
         }
 
@@ -624,9 +635,16 @@ export default function Login() {
                   {debugEAR !== null && (
                     <div className="flex justify-between text-gray-400">
                       <span>Eye Aspect Ratio (EAR)</span>
-                      <span className={debugEAR < EAR_BLINK_CLOSED ? "text-yellow-400" : "text-green-400"}>
+                      <span className={
+                        earHistory.current.length >= 4 &&
+                        Math.max(...earHistory.current) > 0.15 &&
+                        debugEAR <= Math.max(...earHistory.current) * BLINK_DROP_RATIO
+                          ? "text-yellow-400 font-bold"
+                          : "text-green-400"
+                      }>
                         {debugEAR.toFixed(3)}
-                        {debugEAR < EAR_BLINK_CLOSED && " ← blink!"}
+                        {earHistory.current.length >= 2 &&
+                          ` (max ${Math.max(...earHistory.current).toFixed(3)})`}
                       </span>
                     </div>
                   )}
