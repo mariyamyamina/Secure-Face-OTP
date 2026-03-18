@@ -55,6 +55,7 @@ type PageState =
   | "camera-ready"
   | "monitoring"
   | "verifying"
+  | "otp"           // Face matched — waiting for OTP verification
   | "success"
   | "failed";
 
@@ -79,6 +80,14 @@ export default function Login() {
   const [errorMsg,      setErrorMsg]      = useState("");
   const [successMsg,    setSuccessMsg]    = useState("");
   const [confidence,    setConfidence]    = useState<number | null>(null);
+
+  // OTP state
+  const [otpValue,      setOtpValue]      = useState("");
+  const [otpError,      setOtpError]      = useState("");
+  const [otpLoading,    setOtpLoading]    = useState(false);
+  const [otpResendLeft, setOtpResendLeft] = useState(0); // seconds until resend allowed
+  const [devOtp,        setDevOtp]        = useState<string | null>(null); // shown when no SMTP
+  const otpResendTimer  = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Live debug values (shown in monitoring mode)
   const [debugEAR,      setDebugEAR]      = useState<number | null>(null);
@@ -356,9 +365,11 @@ export default function Login() {
       const data = await res.json();
 
       if (res.ok) {
+        // Face matched — now trigger OTP step
         setConfidence(data.confidence ?? null);
-        setSuccessMsg(data.message || "Login successful!");
-        setPageState("success");
+        setPageState("otp");
+        // Fire and forget — don't await so we can get to OTP UI quickly
+        sendOtp();
       } else {
         setErrorMsg(data.error || "Authentication failed.");
         setPageState("failed");
@@ -369,8 +380,72 @@ export default function Login() {
     }
   }, [email]);
 
+  // ─── OTP helpers ─────────────────────────────────────────────────────────
+  const startOtpResendCountdown = useCallback((seconds = 60) => {
+    setOtpResendLeft(seconds);
+    if (otpResendTimer.current) clearInterval(otpResendTimer.current);
+    otpResendTimer.current = setInterval(() => {
+      setOtpResendLeft(prev => {
+        if (prev <= 1) { clearInterval(otpResendTimer.current!); return 0; }
+        return prev - 1;
+      });
+    }, 1000);
+  }, []);
+
+  const sendOtp = useCallback(async () => {
+    setOtpError("");
+    setDevOtp(null);
+    try {
+      const res  = await fetch("/api/send-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (data.dev_otp) setDevOtp(data.dev_otp); // show in UI when no SMTP configured
+        startOtpResendCountdown(60);
+      } else {
+        setOtpError(data.error || "Failed to send OTP");
+      }
+    } catch {
+      setOtpError("Network error sending OTP");
+    }
+  }, [email, startOtpResendCountdown]);
+
+  const verifyOtp = useCallback(async () => {
+    if (otpValue.trim().length !== 6) {
+      setOtpError("Please enter the 6-digit code.");
+      return;
+    }
+    setOtpLoading(true);
+    setOtpError("");
+    try {
+      const res  = await fetch("/api/verify-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, otp: otpValue.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (otpResendTimer.current) clearInterval(otpResendTimer.current);
+        setSuccessMsg("Login successful! Identity fully verified.");
+        setPageState("success");
+      } else {
+        setOtpError(data.error || "OTP verification failed");
+      }
+    } catch {
+      setOtpError("Network error. Please try again.");
+    } finally {
+      setOtpLoading(false);
+    }
+  }, [email, otpValue]);
+
   // ─── Cleanup on unmount ───────────────────────────────────────────────────
-  useEffect(() => () => stopAll(), [stopAll]);
+  useEffect(() => () => {
+    stopAll();
+    if (otpResendTimer.current) clearInterval(otpResendTimer.current);
+  }, [stopAll]);
 
   // ─── Derived values ───────────────────────────────────────────────────────
   const passedCount = Object.values(liveness).filter(Boolean).length;
@@ -413,7 +488,125 @@ export default function Login() {
             </p>
           </motion.div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
+          {/* ── OTP Screen ─────────────────────────────────────────────── */}
+          {pageState === "otp" && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}
+              className="max-w-md mx-auto"
+            >
+              <div className="glass-panel rounded-3xl p-8 border-white/10 text-center">
+                {/* Icon */}
+                <div className="w-16 h-16 rounded-2xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center mx-auto mb-5 shadow-[0_0_30px_rgba(99,102,241,0.2)]">
+                  <ShieldCheck className="w-8 h-8 text-indigo-400" />
+                </div>
+
+                <h2 className="text-2xl font-bold text-white mb-1">Two-Factor Verification</h2>
+                <p className="text-gray-400 text-sm mb-6">
+                  Face verified{confidence !== null ? ` (${confidence}% match)` : ""}.<br />
+                  Enter the 6-digit code sent to <span className="text-indigo-300 font-medium">{email}</span>
+                </p>
+
+                {/* Dev mode OTP hint */}
+                {devOtp && (
+                  <div className="mb-5 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/25 text-yellow-300 text-sm">
+                    <p className="font-semibold mb-0.5">Development Mode</p>
+                    <p className="text-xs text-yellow-400/80">No SMTP configured — your OTP is: <span className="font-mono font-bold text-lg tracking-widest">{devOtp}</span></p>
+                  </div>
+                )}
+
+                {/* 6-digit OTP input */}
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={otpValue}
+                  onChange={e => { setOtpValue(e.target.value.replace(/\D/g, "")); setOtpError(""); }}
+                  onKeyDown={e => e.key === "Enter" && verifyOtp()}
+                  className="w-full text-center text-3xl font-bold tracking-[0.4em] py-4 px-4 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all mb-4"
+                  placeholder="______"
+                />
+
+                {/* Error */}
+                {otpError && (
+                  <motion.p
+                    initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                    className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-4 py-2.5 mb-4"
+                  >
+                    {otpError}
+                  </motion.p>
+                )}
+
+                {/* Verify button */}
+                <button
+                  onClick={verifyOtp}
+                  disabled={otpLoading || otpValue.length !== 6}
+                  className="w-full py-3.5 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 transition-all flex items-center justify-center gap-2 mb-5"
+                >
+                  {otpLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <ShieldCheck className="w-5 h-5" />}
+                  {otpLoading ? "Verifying…" : "Verify OTP"}
+                </button>
+
+                {/* Resend */}
+                <div className="flex items-center justify-center gap-2 text-sm">
+                  {otpResendLeft > 0 ? (
+                    <span className="text-gray-500">
+                      Resend available in <span className="text-indigo-400 font-mono font-semibold">{otpResendLeft}s</span>
+                    </span>
+                  ) : (
+                    <button
+                      onClick={sendOtp}
+                      className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors flex items-center gap-1.5"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Resend OTP
+                    </button>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {/* ── Final Success Screen ────────────────────────────────────── */}
+          {pageState === "success" && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}
+              className="max-w-md mx-auto"
+            >
+              <div className="glass-panel rounded-3xl p-10 border-green-500/20 bg-green-500/5 text-center">
+                <motion.div
+                  initial={{ scale: 0 }} animate={{ scale: 1 }}
+                  transition={{ type: "spring", bounce: 0.5, delay: 0.1 }}
+                  className="w-20 h-20 rounded-full bg-green-500/20 border border-green-500/50 flex items-center justify-center mx-auto mb-5 shadow-[0_0_40px_rgba(34,197,94,0.4)]"
+                >
+                  <ShieldCheck className="w-10 h-10 text-green-400" />
+                </motion.div>
+                <h2 className="text-3xl font-bold text-white mb-2">Access Granted</h2>
+                <p className="text-green-300 mb-6">{successMsg || "Identity fully verified."}</p>
+                {confidence !== null && (
+                  <div className="mb-6">
+                    <p className="text-xs text-gray-400 mb-2">Face Match Confidence</p>
+                    <div className="h-3 rounded-full bg-white/5 overflow-hidden">
+                      <motion.div
+                        initial={{ width: 0 }} animate={{ width: `${confidence}%` }}
+                        transition={{ duration: 1, ease: "easeOut", delay: 0.4 }}
+                        className="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400"
+                      />
+                    </div>
+                    <p className="text-green-400 text-sm font-semibold mt-1">{confidence}% match</p>
+                  </div>
+                )}
+                <button
+                  onClick={resetLiveness}
+                  className="w-full py-3 rounded-xl font-bold text-white bg-white/8 hover:bg-white/12 border border-white/15 transition-all text-sm"
+                >
+                  Sign in with another account
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {/* ── Two-column face auth layout ─────────────────────────────── */}
+          {!["otp","success"].includes(pageState) && <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
 
             {/* ── LEFT: Camera ─────────────────────────────────────────────── */}
             <motion.div initial={{ opacity: 0, x: -30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1 }} className="flex flex-col gap-4">

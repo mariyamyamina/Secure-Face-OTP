@@ -1,0 +1,169 @@
+Build Module 4 (OTP System) and Module 5 (Admin Panel) for an Intelligent Anti-Spoof Face Authentication System.
+
+Tech Stack:
+- Frontend: React (TypeScript, Vite, Tailwind)
+- Backend: FastAPI (Python)
+- Database: MySQL
+
+=====================================
+MODULE 4: OTP SYSTEM (EMAIL VERIFICATION)
+=====================================
+
+GOAL:
+Add a second layer of authentication using OTP after successful face verification during login.
+
+-------------------------------------
+FRONTEND REQUIREMENTS (React)
+-------------------------------------
+
+1. After successful face match:
+   - Show OTP input screen
+   - Input field for 6-digit OTP
+   - "Verify OTP" button
+   - "Resend OTP" option
+
+2. UI:
+   - Clean centered card layout
+   - Show countdown timer (e.g., 60 seconds)
+   - Disable resend until timer ends
+
+3. API Integration:
+   - POST /send-otp
+     Body: { email }
+   - POST /verify-otp
+     Body: { email, otp }
+
+4. Validation:
+   - Show error if OTP is wrong
+   - Show success message if verified
+   - Redirect to dashboard after success
+
+-------------------------------------
+BACKEND REQUIREMENTS (FastAPI)
+-------------------------------------
+
+1. Create OTP logic:
+
+   - Generate 6-digit random OTP
+   - Store OTP in database with:
+     - email
+     - otp
+     - expiry time (5 minutes)
+
+2. Email Sending:
+   - Use SMTP (Gmail) or any email service
+   - Send OTP to user's email
+
+3. APIs:
+
+   POST /send-otp
+   - Generate OTP
+   - Save in DB
+   - Send email
+
+   POST /verify-otp
+   - Check OTP
+   - Check expiry
+   - Return success or failure
+
+4. Security:
+   - OTP expires after 5 minutes
+   - Allow resend OTP
+   - Overwrite old OTP
+
+-------------------------------------
+DATABASE (MySQL)
+-------------------------------------
+
+Create table otp_verification:
+
+Columns:
+- id (INT, PK)
+- email (VARCHAR)
+- otp (VARCHAR)
+- created_at (TIMESTAMP)
+- expires_at (TIMESTAMP)
+
+=====================================
+MODULE 5: ADMIN PANEL
+=====================================
+
+GOAL:
+Allow admin to manage users and prevent fake registrations.
+
+-------------------------------------
+FRONTEND REQUIREMENTS (React)
+-------------------------------------
+
+1. Admin Login Page:
+   - Email + Password
+   - Redirect to admin dashboard
+
+2. Admin Dashboard:
+
+   Features:
+   - View all users
+   - Show:
+     - Email
+     - Registration date
+     - Approval status (Pending / Approved)
+
+3. User Actions:
+   - Approve user
+   - Reject/Delete user
+
+4. UI:
+   - Table layout
+   - Action buttons (Approve / Delete)
+   - Status badge
+
+-------------------------------------
+BACKEND REQUIREMENTS (FastAPI)
+-------------------------------------
+
+1. Admin Authentication:
+   - Hardcoded or DB-based admin login
+
+2. APIs:
+
+   GET /admin/users
+   - Return all users
+
+   PUT /admin/approve-user/{id}
+   - Mark user as approved
+
+   DELETE /admin/delete-user/{id}
+   - Remove user
+
+3. Middleware:
+   - Protect admin routes (only admin access)
+
+-------------------------------------
+DATABASE UPDATE (MySQL)
+-------------------------------------
+
+Update users table:
+
+Add column:
+- is_approved (BOOLEAN DEFAULT FALSE)
+
+-------------------------------------
+INTEGRATION FLOW
+-------------------------------------
+
+1. User registers → status = Pending
+2. Admin approves user
+3. Only approved users can login
+4. Login flow:
+   - Face match → success
+   - OTP sent → verify → login complete
+
+-------------------------------------
+EXPECTED OUTPUT
+-------------------------------------
+
+- Working OTP system with email verification
+- Secure login with 2FA
+- Admin panel to manage users
+- Clean UI and proper API integration
+- Fully structured React + FastAPI + MySQL code
