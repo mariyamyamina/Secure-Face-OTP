@@ -1,6 +1,6 @@
 import { Link, useLocation } from "wouter";
 import { motion } from "framer-motion";
-import { Shield, Menu, X } from "lucide-react";
+import { Shield, Menu, X, ShieldCheck } from "lucide-react";
 import { useState, useEffect } from "react";
 import { cn } from "@/lib/utils";
 
@@ -21,6 +21,7 @@ export function Navbar() {
     { name: "Home", path: "/" },
     { name: "Register", path: "/register" },
     { name: "Login", path: "/login" },
+    { name: "Admin", path: "/admin" },
   ];
 
   return (
