@@ -1,0 +1,104 @@
+Integrate EmailJS into a React (TypeScript) application to send OTP emails for user authentication.
+
+=====================================
+GOAL
+=====================================
+
+- Send a 6-digit OTP to the user's email using EmailJS
+- Use this for verification during login or registration
+
+=====================================
+FRONTEND REQUIREMENTS (React)
+=====================================
+
+1. Install EmailJS:
+
+   Use:
+   npm install @emailjs/browser
+
+-------------------------------------
+
+2. Create a utility function:
+
+   - File: src/lib/emailService.ts
+   - Function to send OTP email
+
+-------------------------------------
+
+3. Generate OTP:
+
+   - Create a function to generate a random 6-digit OTP
+   Example:
+   Math.floor(100000 + Math.random() * 900000)
+
+-------------------------------------
+
+4. Send Email using EmailJS:
+
+   Use:
+   emailjs.send(service_id, template_id, template_params, public_key)
+
+-------------------------------------
+
+5. Template Parameters:
+
+   - to_email: user's email
+   - otp: generated OTP
+
+-------------------------------------
+
+6. UI Implementation:
+
+   - Input field for email
+   - Button: "Send OTP"
+   - Show success message: "OTP sent successfully"
+   - Show error if failed
+
+-------------------------------------
+
+7. Store OTP temporarily:
+
+   - Use React state or localStorage
+   - Example:
+     localStorage.setItem("otp", generatedOtp)
+
+-------------------------------------
+
+8. Verify OTP:
+
+   - Input field for OTP
+   - Button: "Verify OTP"
+   - Compare entered OTP with stored OTP
+
+-------------------------------------
+
+=====================================
+EMAILJS SETUP NOTES
+=====================================
+
+- Create account on EmailJS
+- Create:
+  - Email Service
+  - Email Template
+- Template should include:
+  "Your OTP is {{otp}}"
+
+-------------------------------------
+
+=====================================
+SECURITY NOTE
+=====================================
+
+- This is frontend-based OTP (basic implementation)
+- For production, move OTP logic to backend
+
+-------------------------------------
+
+=====================================
+OUTPUT
+=====================================
+
+- Complete React code for sending OTP
+- EmailJS integration
+- OTP generation and verification
+- Clean and modular code

@@ -75,6 +75,7 @@
     "zod": "catalog:"
   },
   "dependencies": {
+    "@emailjs/browser": "^4.4.1",
     "@vladmandic/face-api": "^1.7.15",
     "react-webcam": "^7.2.0"
   }

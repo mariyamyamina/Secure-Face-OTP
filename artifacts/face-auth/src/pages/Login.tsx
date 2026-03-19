@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { Navbar } from "@/components/layout/Navbar";
 import { useToast } from "@/hooks/use-toast";
+import { generateOTP, sendOTPEmail, emailJSConfigured } from "@/lib/emailService";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
@@ -88,6 +89,7 @@ export default function Login() {
   const [otpResendLeft, setOtpResendLeft] = useState(0); // seconds until resend allowed
   const [devOtp,        setDevOtp]        = useState<string | null>(null); // shown when no SMTP
   const otpResendTimer  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const storedOTP       = useRef<string>("");        // holds the generated OTP in memory
 
   // Live debug values (shown in monitoring mode)
   const [debugEAR,      setDebugEAR]      = useState<number | null>(null);
@@ -163,6 +165,7 @@ export default function Login() {
     setLiveness(blank);
     livenessRef.current = blank;
     earHistory.current   = [];
+    storedOTP.current    = "";
     lipWasOpen.current   = false;
     lipWasClosed.current = false;
     noseBaseline.current = null;
@@ -395,51 +398,54 @@ export default function Login() {
   const sendOtp = useCallback(async () => {
     setOtpError("");
     setDevOtp(null);
-    try {
-      const res  = await fetch("/api/send-otp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        if (data.dev_otp) setDevOtp(data.dev_otp); // show in UI when no SMTP configured
-        startOtpResendCountdown(60);
-      } else {
-        setOtpError(data.error || "Failed to send OTP");
+
+    // Generate a fresh 6-digit OTP and store it in memory
+    const otp = generateOTP();
+    storedOTP.current = otp;
+
+    // Send via EmailJS (frontend) — no backend call needed
+    const result = await sendOTPEmail(email, otp);
+
+    if (result.ok) {
+      // If EmailJS is not configured, show the OTP in the UI for dev testing
+      if (!emailJSConfigured) {
+        setDevOtp(otp);
       }
-    } catch {
-      setOtpError("Network error sending OTP");
+      startOtpResendCountdown(60);
+    } else {
+      setOtpError(result.error ?? "Failed to send OTP email");
     }
   }, [email, startOtpResendCountdown]);
 
   const verifyOtp = useCallback(async () => {
-    if (otpValue.trim().length !== 6) {
-      setOtpError("Please enter the 6-digit code.");
+    const entered = otpValue.trim();
+    if (entered.length !== 6) {
+      setOtpError("Please enter the full 6-digit code.");
       return;
     }
+    if (!storedOTP.current) {
+      setOtpError("No OTP found. Please request a new one.");
+      return;
+    }
+
     setOtpLoading(true);
     setOtpError("");
-    try {
-      const res  = await fetch("/api/verify-otp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, otp: otpValue.trim() }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        if (otpResendTimer.current) clearInterval(otpResendTimer.current);
-        setSuccessMsg("Login successful! Identity fully verified.");
-        setPageState("success");
-      } else {
-        setOtpError(data.error || "OTP verification failed");
-      }
-    } catch {
-      setOtpError("Network error. Please try again.");
-    } finally {
-      setOtpLoading(false);
+
+    // Small artificial delay so the button doesn't flash instantly
+    await new Promise(r => setTimeout(r, 400));
+
+    if (entered === storedOTP.current) {
+      // Clear OTP from memory so it can't be reused
+      storedOTP.current = "";
+      if (otpResendTimer.current) clearInterval(otpResendTimer.current);
+      setSuccessMsg("Login successful! Identity fully verified.");
+      setPageState("success");
+    } else {
+      setOtpError("Incorrect code. Please check and try again.");
     }
-  }, [email, otpValue]);
+
+    setOtpLoading(false);
+  }, [otpValue]);
 
   // ─── Cleanup on unmount ───────────────────────────────────────────────────
   useEffect(() => () => {
@@ -502,15 +508,26 @@ export default function Login() {
 
                 <h2 className="text-2xl font-bold text-white mb-1">Two-Factor Verification</h2>
                 <p className="text-gray-400 text-sm mb-6">
-                  Face verified{confidence !== null ? ` (${confidence}% match)` : ""}.<br />
-                  Enter the 6-digit code sent to <span className="text-indigo-300 font-medium">{email}</span>
+                  Face verified{confidence !== null ? ` (${confidence}% match)` : ""}.{" "}
+                  {emailJSConfigured
+                    ? <>Check <span className="text-indigo-300 font-medium">{email}</span> for your code.</>
+                    : <>EmailJS not configured — see code below.</>
+                  }
                 </p>
 
-                {/* Dev mode OTP hint */}
+                {/* Dev mode OTP hint (shown when EmailJS not configured) */}
                 {devOtp && (
-                  <div className="mb-5 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/25 text-yellow-300 text-sm">
-                    <p className="font-semibold mb-0.5">Development Mode</p>
-                    <p className="text-xs text-yellow-400/80">No SMTP configured — your OTP is: <span className="font-mono font-bold text-lg tracking-widest">{devOtp}</span></p>
+                  <div className="mb-5 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/25 text-yellow-300 text-sm text-left">
+                    <p className="font-semibold mb-1">Development Mode</p>
+                    <p className="text-xs text-yellow-400/80 mb-2">
+                      EmailJS is not configured. Set <code className="text-yellow-300">VITE_EMAILJS_SERVICE_ID</code>,{" "}
+                      <code className="text-yellow-300">VITE_EMAILJS_TEMPLATE_ID</code>, and{" "}
+                      <code className="text-yellow-300">VITE_EMAILJS_PUBLIC_KEY</code> to enable real emails.
+                    </p>
+                    <div className="flex items-center justify-center gap-3 py-2 rounded-lg bg-black/30 border border-yellow-500/20">
+                      <span className="text-yellow-400/70 text-xs">Your OTP:</span>
+                      <span className="font-mono font-bold text-2xl tracking-[0.3em] text-white">{devOtp}</span>
+                    </div>
                   </div>
                 )}
 
