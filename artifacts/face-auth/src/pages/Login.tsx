@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useLocation } from "wouter";
 import Webcam from "react-webcam";
 import * as faceapi from "@vladmandic/face-api";
 import {
@@ -11,6 +12,7 @@ import {
 import { Navbar } from "@/components/layout/Navbar";
 import { useToast } from "@/hooks/use-toast";
 import { generateOTP, sendOTPEmail, emailJSConfigured } from "@/lib/emailService";
+import { useUser } from "@/context/UserContext";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
@@ -70,6 +72,8 @@ const INSTRUCTIONS = [
 
 // ─── Component ────────────────────────────────────────────────────────────────
 export default function Login() {
+  const { login } = useUser();
+  const [, navigate] = useLocation();
   const [pageState,     setPageState]     = useState<PageState>("idle");
   const [email,         setEmail]         = useState("");
   const [modelsLoaded,  setModelsLoaded]  = useState(false);
@@ -438,8 +442,9 @@ export default function Login() {
       // Clear OTP from memory so it can't be reused
       storedOTP.current = "";
       if (otpResendTimer.current) clearInterval(otpResendTimer.current);
-      setSuccessMsg("Login successful! Identity fully verified.");
-      setPageState("success");
+      // Store user and redirect to dashboard
+      login(email);
+      navigate("/dashboard");
     } else {
       setOtpError("Incorrect code. Please check and try again.");
     }
@@ -508,7 +513,7 @@ export default function Login() {
 
                 <h2 className="text-2xl font-bold text-white mb-1">Two-Factor Verification</h2>
                 <p className="text-gray-400 text-sm mb-6">
-                  Face verified{confidence !== null ? ` (${confidence}% match)` : ""}.{" "}
+                  Face verified.{" "}
                   {emailJSConfigured
                     ? <>Check <span className="text-indigo-300 font-medium">{email}</span> for your code.</>
                     : <>EmailJS not configured — see code below.</>

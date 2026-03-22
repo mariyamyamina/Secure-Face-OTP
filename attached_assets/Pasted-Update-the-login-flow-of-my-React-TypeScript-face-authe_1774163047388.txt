@@ -1,0 +1,113 @@
+Update the login flow of my React (TypeScript) face authentication system to show a proper user dashboard instead of displaying "Access Granted" and face match percentage.
+
+=====================================
+GOAL
+=====================================
+
+After successful login (face match + OTP verification), redirect the user to a Dashboard page that displays user details and useful content.
+
+=====================================
+FRONTEND REQUIREMENTS
+=====================================
+
+1. Remove Current Behavior:
+
+   - Do NOT display:
+     - "Access Granted"
+     - Face match percentage
+
+-------------------------------------
+
+2. Create a Dashboard Page:
+
+   File:
+   src/pages/Dashboard.tsx
+
+-------------------------------------
+
+3. After Successful Login:
+
+   - Redirect user to "/dashboard" route
+   - Use React Router for navigation
+
+-------------------------------------
+
+4. Pass User Data:
+
+   Store user details after login:
+   - email
+   - name (if available)
+
+   Use:
+   - React Context OR
+   - localStorage OR
+   - state management
+
+-------------------------------------
+
+5. Dashboard UI Design:
+
+   Create a clean and modern dashboard with:
+
+   A. Welcome Section:
+      - "Welcome, [User Name]"
+      - Display user email
+
+   B. Profile Card:
+      - Name
+      - Email
+      - Status: "Authenticated Successfully"
+
+   C. Features Section:
+      - Short description of system:
+        "You are logged in using a secure multi-layer authentication system including face recognition, liveness detection, and OTP verification."
+
+   D. Actions:
+      - Logout button
+      - Optional: "Re-verify Face"
+
+-------------------------------------
+
+6. Navbar:
+
+   - Add Navbar with:
+     - Home
+     - Dashboard
+     - Logout
+
+-------------------------------------
+
+7. Routing:
+
+   Add route:
+   /dashboard → Dashboard page
+
+-------------------------------------
+
+8. Logout Functionality:
+
+   - Clear stored user data
+   - Redirect to login page
+
+-------------------------------------
+
+=====================================
+OPTIONAL IMPROVEMENTS
+=====================================
+
+- Add profile avatar icon
+- Add animation on login success
+- Add login history section
+- Add security status indicator (green badge)
+
+-------------------------------------
+
+=====================================
+EXPECTED OUTPUT
+=====================================
+
+- Dashboard page with user details
+- Navigation after login
+- Clean UI (no "Access Granted" message)
+- Proper state handling
+- Modular and readable code

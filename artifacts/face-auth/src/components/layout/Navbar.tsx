@@ -1,11 +1,13 @@
 import { Link, useLocation } from "wouter";
 import { motion } from "framer-motion";
-import { Shield, Menu, X, ShieldCheck } from "lucide-react";
+import { Shield, Menu, X, LogOut } from "lucide-react";
 import { useState, useEffect } from "react";
 import { cn } from "@/lib/utils";
+import { useUser } from "@/context/UserContext";
 
 export function Navbar() {
-  const [location] = useLocation();
+  const { user, logout } = useUser();
+  const [location, navigate] = useLocation();
   const [isScrolled, setIsScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -17,12 +19,24 @@ export function Navbar() {
     return () => window.removeEventListener("scroll", handleScroll);
   }, []);
 
-  const navLinks = [
+  const baseLinks = [
     { name: "Home", path: "/" },
     { name: "Register", path: "/register" },
     { name: "Login", path: "/login" },
-    { name: "Admin", path: "/admin" },
   ];
+
+  const authedLinks = [
+    { name: "Home", path: "/" },
+    { name: "Dashboard", path: "/dashboard" },
+  ];
+
+  const navLinks = user ? authedLinks : baseLinks;
+
+  function handleLogout() {
+    logout();
+    navigate("/login");
+    setMobileMenuOpen(false);
+  }
 
   return (
     <header
@@ -32,14 +46,14 @@ export function Navbar() {
       )}
     >
       <div className="container mx-auto px-4 md:px-6">
-        <motion.div 
+        <motion.div
           initial={{ y: -20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
           transition={{ duration: 0.5 }}
           className={cn(
             "flex items-center justify-between rounded-2xl px-6 py-3 transition-all duration-300",
-            isScrolled 
-              ? "glass-panel shadow-[var(--shadow-glow)]" 
+            isScrolled
+              ? "glass-panel shadow-[var(--shadow-glow)]"
               : "bg-transparent border border-transparent"
           )}
         >
@@ -79,17 +93,28 @@ export function Navbar() {
             })}
           </nav>
 
-          <div className="hidden md:flex items-center">
-            <Link 
-              href="/register" 
-              className="px-5 py-2.5 text-sm font-medium text-white bg-white/10 hover:bg-white/20 border border-white/10 rounded-xl transition-all duration-300 hover:shadow-[0_0_20px_rgba(255,255,255,0.1)] active:scale-95"
-            >
-              Get Started
-            </Link>
+          {/* Right CTA */}
+          <div className="hidden md:flex items-center gap-2">
+            {user ? (
+              <button
+                onClick={handleLogout}
+                className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-red-300 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 hover:border-red-500/30 rounded-xl transition-all duration-300 active:scale-95"
+              >
+                <LogOut className="w-4 h-4" />
+                Logout
+              </button>
+            ) : (
+              <Link
+                href="/register"
+                className="px-5 py-2.5 text-sm font-medium text-white bg-white/10 hover:bg-white/20 border border-white/10 rounded-xl transition-all duration-300 hover:shadow-[0_0_20px_rgba(255,255,255,0.1)] active:scale-95"
+              >
+                Get Started
+              </Link>
+            )}
           </div>
 
           {/* Mobile Toggle */}
-          <button 
+          <button
             className="md:hidden p-2 text-muted-foreground hover:text-white transition-colors"
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
           >
@@ -112,14 +137,31 @@ export function Navbar() {
                 onClick={() => setMobileMenuOpen(false)}
                 className={cn(
                   "px-4 py-3 rounded-xl text-sm font-medium transition-colors",
-                  location === link.path 
-                    ? "bg-white/10 text-white" 
+                  location === link.path
+                    ? "bg-white/10 text-white"
                     : "text-muted-foreground hover:bg-white/5 hover:text-white"
                 )}
               >
                 {link.name}
               </Link>
             ))}
+            {user ? (
+              <button
+                onClick={handleLogout}
+                className="flex items-center gap-2 px-4 py-3 rounded-xl text-sm font-medium text-red-300 hover:bg-red-500/10 transition-colors"
+              >
+                <LogOut className="w-4 h-4" />
+                Logout
+              </button>
+            ) : (
+              <Link
+                href="/register"
+                onClick={() => setMobileMenuOpen(false)}
+                className="px-4 py-3 rounded-xl text-sm font-medium text-white bg-white/10 hover:bg-white/15 transition-colors text-center"
+              >
+                Get Started
+              </Link>
+            )}
           </motion.div>
         )}
       </div>
