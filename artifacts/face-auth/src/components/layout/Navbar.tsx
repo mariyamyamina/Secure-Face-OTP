@@ -23,11 +23,13 @@ export function Navbar() {
     { name: "Home", path: "/" },
     { name: "Register", path: "/register" },
     { name: "Login", path: "/login" },
+    { name: "Admin", path: "/admin" },
   ];
 
   const authedLinks = [
     { name: "Home", path: "/" },
     { name: "Dashboard", path: "/dashboard" },
+    { name: "Admin", path: "/admin" },
   ];
 
   const navLinks = user ? authedLinks : baseLinks;
