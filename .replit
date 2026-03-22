@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-24", "python-3.11"]
 
 [[artifacts]]
 id = "artifacts/api-server"
@@ -68,3 +68,7 @@ timeoutMs = 20000
 VITE_EMAILJS_SERVICE_ID = "service_dl0qva7"
 VITE_EMAILJS_TEMPLATE_ID = "template_5n2lykm"
 VITE_EMAILJS_PUBLIC_KEY = "UmaDeupHmxUmDWaXj"
+
+[nix]
+channel = "stable-25_05"
+packages = ["libxcrypt"]

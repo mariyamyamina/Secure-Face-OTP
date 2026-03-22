@@ -48,3 +48,15 @@ Thumbs.db
 .cache/
 .local/
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
