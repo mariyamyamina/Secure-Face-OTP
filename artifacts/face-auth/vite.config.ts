@@ -66,6 +66,14 @@ export default defineConfig({
       strict: true,
       deny: ["**/.*"],
     },
+    // Proxy /api/* to the Express backend so relative API calls work locally.
+    // In Replit this is handled by the platform proxy automatically.
+    proxy: {
+      "/api": {
+        target: `http://localhost:${process.env.API_PORT ?? 8080}`,
+        changeOrigin: true,
+      },
+    },
   },
   preview: {
     port,
