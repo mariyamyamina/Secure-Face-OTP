@@ -5,10 +5,9 @@ import Webcam from "react-webcam";
 import * as faceapi from "@vladmandic/face-api";
 import { 
   ShieldCheck, AlertCircle, Scan, Fingerprint, 
-  Loader2, CheckCircle2, ChevronRight, User, Key 
+  Loader2, CheckCircle2, ChevronRight, User, Key, Mail
 } from "lucide-react";
 import { Navbar } from "@/components/layout/Navbar";
-import { useRegisterFace } from "@workspace/api-client-react";
 import { useToast } from "@/hooks/use-toast";
 
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
@@ -17,23 +16,24 @@ export default function Register() {
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
   
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [formError, setFormError] = useState("");
+
   const [isCapturing, setIsCapturing] = useState(false);
   const [descriptor, setDescriptor] = useState<number[] | null>(null);
   const [scanStatus, setScanStatus] = useState<'idle' | 'scanning' | 'success' | 'error'>('idle');
   const [scanMessage, setScanMessage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
   const { toast } = useToast();
-  
-  const registerMutation = useRegisterFace();
 
   useEffect(() => {
     const loadModels = async () => {
       try {
-        // Wait for TensorFlow.js backend to be ready before loading models
         await faceapi.tf.setBackend('cpu');
         await faceapi.tf.ready();
         await Promise.all([
@@ -67,7 +67,6 @@ export default function Register() {
     }
 
     try {
-      // Create HTML Image Element from base64
       const img = new Image();
       img.src = imageSrc;
       
@@ -109,9 +108,26 @@ export default function Register() {
     }
   }, [toast]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+    setFormError("");
+
+    if (!name.trim()) {
+      setFormError("Full name is required.");
+      return;
+    }
+    if (!email.trim()) {
+      setFormError("Email address is required.");
+      return;
+    }
+    if (password.length < 6) {
+      setFormError("Password must be at least 6 characters.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setFormError("Passwords do not match.");
+      return;
+    }
     if (!descriptor) {
       toast({
         variant: "destructive",
@@ -121,37 +137,32 @@ export default function Register() {
       return;
     }
 
-    if (password.length < 6) {
-      toast({
-        variant: "destructive",
-        title: "Weak Password",
-        description: "Password must be at least 6 characters.",
+    setSubmitting(true);
+    try {
+      const res = await fetch("/api/register-face", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim(), email, password, face_descriptor: descriptor }),
       });
-      return;
-    }
+      const data = await res.json();
 
-    registerMutation.mutate(
-      { data: { email, password, face_descriptor: descriptor } },
-      {
-        onSuccess: () => {
-          toast({
-            title: "Registration Complete",
-            description: "Your identity has been securely vaulted. Redirecting...",
-          });
-          // In a real app, redirect to login after a delay
-          setTimeout(() => {
-            window.location.href = "/login";
-          }, 2000);
-        },
-        onError: (err) => {
-          toast({
-            variant: "destructive",
-            title: "Registration Failed",
-            description: err.response?.data?.error || "An unexpected error occurred.",
-          });
-        }
+      if (!res.ok) {
+        setFormError(data.error || "Registration failed. Please try again.");
+        return;
       }
-    );
+
+      toast({
+        title: "Registration Complete",
+        description: "Your identity has been securely vaulted. Redirecting to login...",
+      });
+      setTimeout(() => {
+        window.location.href = "/login";
+      }, 2000);
+    } catch {
+      setFormError("Network error. Please check your connection.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -165,7 +176,7 @@ export default function Register() {
 
       <main className="flex-1 container mx-auto px-4 md:px-6 py-24 md:py-32 relative z-10 flex items-center justify-center">
         
-        <div className="w-full max-w-6xl grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
+        <div className="w-full max-w-6xl grid grid-cols-1 lg:grid-cols-[5fr_6fr] gap-8 items-start">
           
           {/* Left Column: Form */}
           <motion.div 
@@ -174,32 +185,53 @@ export default function Register() {
             transition={{ duration: 0.6 }}
             className="glass-panel p-8 md:p-10 rounded-3xl border-white/10 flex flex-col h-full"
           >
-            <div className="mb-8">
-              <h2 className="text-3xl font-display font-bold text-white mb-2">Initialize Identity</h2>
-              <p className="text-muted-foreground text-sm">Create your biometric vault to secure your access.</p>
+            <div className="mb-7">
+              <h2 className="text-3xl font-display font-bold text-white mb-2">Create Account</h2>
+              <p className="text-muted-foreground text-sm">Fill in your details and scan your face to register.</p>
             </div>
 
-            <form onSubmit={handleSubmit} className="space-y-6 flex-1 flex flex-col">
+            <form onSubmit={handleSubmit} className="space-y-5 flex-1 flex flex-col">
               <div className="space-y-4">
+
+                {/* Full Name */}
                 <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-300 ml-1">Email Address</label>
+                  <label className="text-sm font-medium text-gray-300 ml-1">Full Name</label>
                   <div className="relative">
                     <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
                       <User className="h-5 w-5 text-gray-500" />
                     </div>
                     <input
-                      type="email"
+                      type="text"
                       required
-                      value={email}
-                      onChange={(e) => setEmail(e.target.value)}
+                      value={name}
+                      onChange={(e) => { setName(e.target.value); setFormError(""); }}
                       className="w-full pl-11 pr-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all"
-                      placeholder="operative@aura.sys"
+                      placeholder="John Doe"
                     />
                   </div>
                 </div>
 
+                {/* Email */}
                 <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-300 ml-1">Secure Passphrase</label>
+                  <label className="text-sm font-medium text-gray-300 ml-1">Email Address</label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                      <Mail className="h-5 w-5 text-gray-500" />
+                    </div>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => { setEmail(e.target.value); setFormError(""); }}
+                      className="w-full pl-11 pr-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all"
+                      placeholder="you@example.com"
+                    />
+                  </div>
+                </div>
+
+                {/* Password */}
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-gray-300 ml-1">Password</label>
                   <div className="relative">
                     <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
                       <Key className="h-5 w-5 text-gray-500" />
@@ -208,45 +240,92 @@ export default function Register() {
                       type="password"
                       required
                       value={password}
-                      onChange={(e) => setPassword(e.target.value)}
+                      onChange={(e) => { setPassword(e.target.value); setFormError(""); }}
                       className="w-full pl-11 pr-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary/50 transition-all"
-                      placeholder="••••••••••••"
+                      placeholder="Min. 6 characters"
                     />
                   </div>
                 </div>
+
+                {/* Confirm Password */}
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-gray-300 ml-1">Confirm Password</label>
+                  <div className="relative">
+                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                      <Key className="h-5 w-5 text-gray-500" />
+                    </div>
+                    <input
+                      type="password"
+                      required
+                      value={confirmPassword}
+                      onChange={(e) => { setConfirmPassword(e.target.value); setFormError(""); }}
+                      className={`w-full pl-11 pr-4 py-3.5 bg-black/40 border rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 transition-all ${
+                        confirmPassword && password !== confirmPassword
+                          ? "border-red-500/60 focus:ring-red-500/30 focus:border-red-500/60"
+                          : "border-white/10 focus:ring-primary/50 focus:border-primary/50"
+                      }`}
+                      placeholder="Re-enter your password"
+                    />
+                  </div>
+                  {confirmPassword && password !== confirmPassword && (
+                    <p className="text-xs text-red-400 ml-1 mt-1">Passwords do not match</p>
+                  )}
+                </div>
               </div>
 
-              {/* Status Indicator */}
-              <div className="mt-8 p-4 rounded-xl bg-black/30 border border-white/5 flex items-center gap-4">
+              {/* Form error */}
+              <AnimatePresence>
+                {formError && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -6 }}
+                    className="flex items-start gap-2 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm"
+                  >
+                    <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                    {formError}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Biometric status */}
+              <div className="p-4 rounded-xl bg-black/30 border border-white/5 flex items-center gap-4">
                 <div className={`p-2 rounded-lg ${descriptor ? 'bg-green-500/20 text-green-400' : 'bg-white/5 text-gray-400'}`}>
                   <Fingerprint className="w-6 h-6" />
                 </div>
                 <div>
                   <h4 className="text-sm font-medium text-white">Biometric Status</h4>
                   <p className={`text-xs ${descriptor ? 'text-green-400' : 'text-gray-400'}`}>
-                    {descriptor ? 'Descriptor acquired and validated.' : 'Awaiting facial scan...'}
+                    {descriptor ? 'Face descriptor captured and ready.' : 'Awaiting facial scan on the right...'}
                   </p>
                 </div>
               </div>
 
-              <div className="mt-auto pt-8">
+              <div className="mt-auto pt-2">
                 <button
                   type="submit"
-                  disabled={!descriptor || registerMutation.isPending}
+                  disabled={!descriptor || submitting || (confirmPassword.length > 0 && password !== confirmPassword)}
                   className="w-full py-4 px-6 rounded-xl font-bold text-white bg-gradient-to-r from-primary to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 flex items-center justify-center gap-2 group"
                 >
-                  {registerMutation.isPending ? (
+                  {submitting ? (
                     <>
                       <Loader2 className="w-5 h-5 animate-spin" />
-                      Encrypting...
+                      Creating account...
                     </>
                   ) : (
                     <>
-                      Initialize Sequence
+                      Create Account
                       <ChevronRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
                     </>
                   )}
                 </button>
+
+                <p className="text-center text-sm text-muted-foreground mt-4">
+                  Already have an account?{" "}
+                  <Link href="/login" className="text-primary hover:text-primary/80 font-medium transition-colors">
+                    Sign in
+                  </Link>
+                </p>
               </div>
             </form>
           </motion.div>
@@ -258,9 +337,12 @@ export default function Register() {
             transition={{ duration: 0.6, delay: 0.1 }}
             className="flex flex-col h-full"
           >
+            <div className="mb-4 px-1">
+              <h3 className="text-lg font-semibold text-white mb-1">Face Scan</h3>
+              <p className="text-muted-foreground text-sm">Position your face in the frame and press the button below to capture your biometric.</p>
+            </div>
+
             <div className="glass-panel p-2 rounded-3xl border-white/10 overflow-hidden relative shadow-2xl bg-black/60">
-              
-              {/* Overlay grid for aesthetics */}
               <div className="absolute inset-0 z-10 pointer-events-none opacity-20 bg-[linear-gradient(rgba(255,255,255,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.1)_1px,transparent_1px)] bg-[size:20px_20px]" />
               
               {!modelsLoaded ? (
@@ -287,17 +369,14 @@ export default function Register() {
                     className={`w-full h-full object-cover transition-opacity duration-500 ${descriptor ? 'opacity-50 grayscale blur-[2px]' : 'opacity-100'}`}
                   />
                   
-                  {/* Scanner Overlay UI */}
                   {!descriptor && (
                     <div className="absolute inset-0 z-20 pointer-events-none flex items-center justify-center">
                       <div className="w-48 h-64 border-2 border-primary/30 rounded-[40px] relative">
-                        {/* Corner markers */}
                         <div className="absolute -top-1 -left-1 w-4 h-4 border-t-2 border-l-2 border-primary" />
                         <div className="absolute -top-1 -right-1 w-4 h-4 border-t-2 border-r-2 border-primary" />
                         <div className="absolute -bottom-1 -left-1 w-4 h-4 border-b-2 border-l-2 border-primary" />
                         <div className="absolute -bottom-1 -right-1 w-4 h-4 border-b-2 border-r-2 border-primary" />
                         
-                        {/* Scanning beam */}
                         {scanStatus === 'scanning' && (
                           <motion.div 
                             initial={{ top: 0, opacity: 0 }}
@@ -310,7 +389,6 @@ export default function Register() {
                     </div>
                   )}
 
-                  {/* Success Overlay */}
                   <AnimatePresence>
                     {descriptor && (
                       <motion.div 
@@ -326,7 +404,7 @@ export default function Register() {
                         >
                           <CheckCircle2 className="w-10 h-10 text-green-400" />
                         </motion.div>
-                        <h3 className="text-xl font-bold text-white mb-1">Identity Verified</h3>
+                        <h3 className="text-xl font-bold text-white mb-1">Face Captured</h3>
                         <p className="text-sm text-green-400">Descriptor locked & ready</p>
                         
                         <button 
@@ -339,7 +417,6 @@ export default function Register() {
                     )}
                   </AnimatePresence>
 
-                  {/* Top Status Bar */}
                   <div className="absolute top-4 left-4 right-4 z-20 flex justify-between items-center">
                     <div className="flex items-center gap-2 bg-black/50 backdrop-blur-md px-3 py-1.5 rounded-full border border-white/10">
                       <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
@@ -362,7 +439,7 @@ export default function Register() {
                 </div>
               </button>
               
-              <div className="mt-6 h-8 text-center">
+              <div className="mt-4 h-8 text-center">
                 <AnimatePresence mode="wait">
                   <motion.p 
                     key={scanStatus}
@@ -375,7 +452,7 @@ export default function Register() {
                       'text-muted-foreground'
                     }`}
                   >
-                    {scanMessage || (modelsLoaded ? "Align face in frame and press to extract" : "Waking up visual sensors...")}
+                    {scanMessage || (modelsLoaded ? "Align face in frame and press to scan" : "Waking up visual sensors...")}
                   </motion.p>
                 </AnimatePresence>
               </div>

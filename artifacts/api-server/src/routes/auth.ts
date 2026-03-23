@@ -22,6 +22,7 @@ router.post("/register-face", async (req, res) => {
   }
 
   const { email, password, face_descriptor } = parsed.data;
+  const name = typeof req.body.name === "string" ? req.body.name.trim() : null;
 
   try {
     const existing = await db
@@ -40,7 +41,7 @@ router.post("/register-face", async (req, res) => {
 
     const [newUser] = await db
       .insert(usersTable)
-      .values({ email, password: hashedPassword, face_descriptor: descriptorJson })
+      .values({ name, email, password: hashedPassword, face_descriptor: descriptorJson })
       .returning({ id: usersTable.id });
 
     res.status(201).json({
@@ -82,7 +83,6 @@ router.post("/login-face", async (req, res) => {
 
     const user = users[0];
 
-    // Enforce admin approval before login is allowed
     if (!user.is_approved) {
       res.status(403).json({
         error: "Account pending approval. Please wait for an admin to approve your account.",
@@ -105,17 +105,62 @@ router.post("/login-face", async (req, res) => {
       return;
     }
 
-    // Confidence score: 100% at distance=0, 0% at threshold
     const confidence = Math.max(0, Math.round((1 - distance / THRESHOLD) * 100));
 
-    // Face matched — OTP will be sent by the frontend next
     res.status(200).json({
       message: "Face verified. OTP will be sent to your email.",
       face_matched: true,
       confidence,
+      name: user.name ?? null,
     });
   } catch (err) {
     console.error("Login error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/login - Email + password login
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body ?? {};
+  if (!email || typeof email !== "string" || !password || typeof password !== "string") {
+    res.status(400).json({ error: "Invalid input" });
+    return;
+  }
+
+  try {
+    const users = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.email, email))
+      .limit(1);
+
+    if (users.length === 0) {
+      res.status(401).json({ error: "Invalid email or password." });
+      return;
+    }
+
+    const user = users[0];
+
+    if (!user.is_approved) {
+      res.status(403).json({
+        error: "Account pending approval. Please wait for an admin to approve your account.",
+      });
+      return;
+    }
+
+    const passwordMatch = await bcrypt.compare(password, user.password);
+    if (!passwordMatch) {
+      res.status(401).json({ error: "Invalid email or password." });
+      return;
+    }
+
+    res.status(200).json({
+      message: "Login successful.",
+      email: user.email,
+      name: user.name ?? null,
+    });
+  } catch (err) {
+    console.error("Password login error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

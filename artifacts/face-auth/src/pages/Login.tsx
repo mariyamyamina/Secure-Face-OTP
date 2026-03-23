@@ -86,6 +86,13 @@ export default function Login() {
   const [successMsg,    setSuccessMsg]    = useState("");
   const [confidence,    setConfidence]    = useState<number | null>(null);
 
+  // Login mode
+  const [loginMode,     setLoginMode]     = useState<"face" | "password">("face");
+  const [pwInput,       setPwInput]       = useState("");
+  const [pwLoading,     setPwLoading]     = useState(false);
+  const [pwError,       setPwError]       = useState("");
+  const [userName,      setUserName]      = useState("");
+
   // OTP state
   const [otpValue,      setOtpValue]      = useState("");
   const [otpError,      setOtpError]      = useState("");
@@ -374,6 +381,7 @@ export default function Login() {
       if (res.ok) {
         // Face matched — now trigger OTP step
         setConfidence(data.confidence ?? null);
+        setUserName(data.name ?? "");
         setPageState("otp");
         // Fire and forget — don't await so we can get to OTP UI quickly
         sendOtp();
@@ -443,7 +451,7 @@ export default function Login() {
       storedOTP.current = "";
       if (otpResendTimer.current) clearInterval(otpResendTimer.current);
       // Store user and redirect to dashboard
-      login(email);
+      login(email, userName || undefined);
       navigate("/dashboard");
     } else {
       setOtpError("Incorrect code. Please check and try again.");
@@ -457,6 +465,31 @@ export default function Login() {
     stopAll();
     if (otpResendTimer.current) clearInterval(otpResendTimer.current);
   }, [stopAll]);
+
+  // ─── Password login ───────────────────────────────────────────────────────
+  const handlePasswordLogin = useCallback(async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPwError("");
+    setPwLoading(true);
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: pwInput }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setPwError(data.error || "Login failed. Please try again.");
+        return;
+      }
+      login(email, data.name ?? undefined);
+      navigate("/dashboard");
+    } catch {
+      setPwError("Network error. Please check your connection.");
+    } finally {
+      setPwLoading(false);
+    }
+  }, [email, pwInput, login, navigate]);
 
   // ─── Derived values ───────────────────────────────────────────────────────
   const passedCount = Object.values(liveness).filter(Boolean).length;
@@ -498,6 +531,107 @@ export default function Login() {
               The system verifies you're a real person using four liveness signals before granting access.
             </p>
           </motion.div>
+
+          {/* ── Login Mode Tab Switcher ─────────────────────────────── */}
+          {pageState === "idle" && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
+              className="flex justify-center mb-8"
+            >
+              <div className="flex gap-1 p-1 rounded-2xl bg-white/5 border border-white/10">
+                <button
+                  onClick={() => { setLoginMode("face"); setPwError(""); }}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 ${
+                    loginMode === "face"
+                      ? "bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-[0_0_20px_rgba(99,102,241,0.3)]"
+                      : "text-muted-foreground hover:text-white"
+                  }`}
+                >
+                  Face Login
+                </button>
+                <button
+                  onClick={() => { setLoginMode("password"); setPwError(""); }}
+                  className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 ${
+                    loginMode === "password"
+                      ? "bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-[0_0_20px_rgba(99,102,241,0.3)]"
+                      : "text-muted-foreground hover:text-white"
+                  }`}
+                >
+                  Password Login
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {/* ── Password Login Form ──────────────────────────────────── */}
+          {loginMode === "password" && pageState === "idle" && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }}
+              className="max-w-md mx-auto"
+            >
+              <div className="glass-panel rounded-3xl p-8 border-white/10">
+                <h2 className="text-2xl font-bold text-white mb-1">Sign In</h2>
+                <p className="text-gray-400 text-sm mb-7">Enter your email and password to access your account.</p>
+
+                <form onSubmit={handlePasswordLogin} className="space-y-5">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-300 ml-1">Email Address</label>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => { setEmail(e.target.value); setPwError(""); }}
+                      className="w-full px-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
+                      placeholder="you@example.com"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-300 ml-1">Password</label>
+                    <input
+                      type="password"
+                      required
+                      value={pwInput}
+                      onChange={(e) => { setPwInput(e.target.value); setPwError(""); }}
+                      className="w-full px-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
+                      placeholder="••••••••••••"
+                    />
+                  </div>
+
+                  <AnimatePresence>
+                    {pwError && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+                        className="flex items-center gap-2 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm"
+                      >
+                        <ShieldX className="w-4 h-4 flex-shrink-0" />
+                        {pwError}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  <button
+                    type="submit"
+                    disabled={pwLoading}
+                    className="w-full py-4 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-500 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-60 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 flex items-center justify-center gap-2"
+                  >
+                    {pwLoading ? (
+                      <><Loader2 className="w-5 h-5 animate-spin" /> Signing in...</>
+                    ) : (
+                      <><ShieldCheck className="w-5 h-5" /> Sign In</>
+                    )}
+                  </button>
+
+                  <p className="text-center text-sm text-muted-foreground pt-1">
+                    Don't have an account?{" "}
+                    <a href="/register" className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors">
+                      Register
+                    </a>
+                  </p>
+                </form>
+              </div>
+            </motion.div>
+          )}
 
           {/* ── OTP Screen ─────────────────────────────────────────────── */}
           {pageState === "otp" && (
@@ -628,7 +762,7 @@ export default function Login() {
           )}
 
           {/* ── Two-column face auth layout ─────────────────────────────── */}
-          {!["otp","success"].includes(pageState) && <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
+          {loginMode === "face" && !["otp","success"].includes(pageState) && <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
 
             {/* ── LEFT: Camera ─────────────────────────────────────────────── */}
             <motion.div initial={{ opacity: 0, x: -30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1 }} className="flex flex-col gap-4">
