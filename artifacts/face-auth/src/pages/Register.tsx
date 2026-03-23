@@ -77,7 +77,7 @@ export default function Register() {
 
       const detections = await faceapi.detectAllFaces(
         img, 
-        new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 })
+        new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 })
       )
       .withFaceLandmarks()
       .withFaceDescriptors();

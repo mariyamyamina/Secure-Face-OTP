@@ -355,24 +355,42 @@ export default function Login() {
     if (!video) { setErrorMsg("Camera unavailable."); setPageState("failed"); return; }
 
     try {
-      // Now we DO need the descriptor for matching — run the full pipeline once
-      const det = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
-        .withFaceLandmarks()
-        .withFaceDescriptor();
+      // Capture 3 frames and average the descriptors — much more robust than a single capture.
+      // This smooths out noise from lighting/angle variation between frames.
+      const SAMPLES = 3;
+      const descriptors: Float32Array[] = [];
 
-      if (!det) {
-        setErrorMsg("No face detected at verification time. Please try again.");
+      for (let i = 0; i < SAMPLES; i++) {
+        // Small delay between captures to let the camera frame refresh
+        if (i > 0) await new Promise(r => setTimeout(r, 300));
+
+        const det = await faceapi
+          .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 }))
+          .withFaceLandmarks()
+          .withFaceDescriptor();
+
+        if (det) descriptors.push(det.descriptor);
+      }
+
+      if (descriptors.length === 0) {
+        setErrorMsg("No face detected at verification time. Please look directly at the camera and try again.");
         setPageState("failed");
         return;
       }
+
+      // Average the captured descriptors
+      const avgDescriptor = new Float32Array(128);
+      for (const d of descriptors) {
+        for (let j = 0; j < 128; j++) avgDescriptor[j] += d[j];
+      }
+      for (let j = 0; j < 128; j++) avgDescriptor[j] /= descriptors.length;
 
       const res = await fetch("/api/login-face", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           email,
-          face_descriptor: Array.from(det.descriptor),
+          face_descriptor: Array.from(avgDescriptor),
           liveness_passed: true,
         }),
       });

@@ -98,10 +98,14 @@ router.post("/login-face", async (req, res) => {
     }
 
     const distance = euclideanDistance(face_descriptor, storedDescriptor);
-    const THRESHOLD = 0.5;
+    // face-api.js recommends 0.6 as the recognition threshold.
+    // 0.5 is too strict and rejects real users with slight lighting/angle variation.
+    const THRESHOLD = 0.6;
+
+    console.log(`[face-match] user=${email} distance=${distance.toFixed(4)} threshold=${THRESHOLD} matched=${distance <= THRESHOLD}`);
 
     if (distance > THRESHOLD) {
-      res.status(401).json({ error: "Face does not match. Please try again." });
+      res.status(401).json({ error: "Face does not match. Please try again.", distance: parseFloat(distance.toFixed(4)) });
       return;
     }
 
