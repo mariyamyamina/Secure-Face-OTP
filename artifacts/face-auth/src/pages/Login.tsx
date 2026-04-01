@@ -1,56 +1,64 @@
+/**
+ * Login.tsx — Biometric Authentication Pipeline
+ *
+ * The authentication flow is divided into five clearly separated stages:
+ *
+ *  Stage 1 · Face Detection
+ *    face-api.js TinyFaceDetector locates the face and extracts 68 landmarks
+ *    every DETECTION_INTERVAL_MS milliseconds.
+ *
+ *  Stage 2 · Anti-Spoofing (runs concurrently with Stage 3)
+ *    AntiSpoofEngine analyses the face crop for:
+ *      · Glare / specular reflection (screen hotspots)
+ *      · LBP micro-texture entropy (real skin vs. printed / screen texture)
+ *      · Colour naturalness (skin-tone distribution)
+ *      · Temporal micro-variance (organic face motion vs. static image)
+ *    Three consecutive "spoof" readings → session rejected immediately.
+ *
+ *  Stage 3 · Liveness Detection (runs concurrently with Stage 2)
+ *    LivenessDetector requires the user to complete four behavioural proofs:
+ *      · Blink (EAR drop relative to rolling max)
+ *      · Lip movement (open → close cycle)
+ *      · Head movement (nose-tip displacement from baseline)
+ *      · Skin texture (temporal MAD variance)
+ *
+ *  Stage 4 · Face Recognition
+ *    Once Stages 2 & 3 both pass: three descriptor captures are averaged and
+ *    sent to POST /api/login-face.  The backend computes Euclidean distance
+ *    against the stored descriptor (threshold 0.6).
+ *
+ *  Stage 5 · OTP Verification
+ *    If the face matches, a 6-digit OTP is sent via EmailJS.
+ *    Successful OTP entry grants dashboard access.
+ */
+
 import { useState, useRef, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useLocation } from "wouter";
 import Webcam from "react-webcam";
 import * as faceapi from "@vladmandic/face-api";
 import {
-  Eye, Smile, Move, Layers, CheckCircle2,
-  XCircle, Loader2, ShieldCheck, ShieldX,
-  RefreshCw, User, Timer, ChevronRight,
-  AlertTriangle, Zap, Activity,
+  Eye, Smile, Move, Layers, CheckCircle2, XCircle, Loader2,
+  ShieldCheck, ShieldX, RefreshCw, User, Timer, AlertTriangle,
+  Activity, Shield, Zap,
 } from "lucide-react";
 import { Navbar } from "@/components/layout/Navbar";
 import { useToast } from "@/hooks/use-toast";
 import { generateOTP, sendOTPEmail, emailJSConfigured } from "@/lib/emailService";
 import { useUser } from "@/context/UserContext";
+import { LivenessDetector, type LivenessState } from "@/lib/livenessDetector";
+import { AntiSpoofEngine, type SpoofSignals } from "@/lib/antiSpoofing";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
-const DETECTION_INTERVAL_MS = 200;   // 200ms — fast enough to catch a 200ms blink
-const LIVENESS_TIMEOUT_S = 25;       // 25 seconds total
+// ── Constants ──────────────────────────────────────────────────────────────────
 
-// Blink: relative drop. When EAR falls to ≤75% of the rolling max, it's a blink.
-// Works at any face distance — no fixed absolute threshold needed.
-const BLINK_DROP_RATIO = 0.75;
-const EAR_HISTORY_SIZE = 12;        // Rolling window of recent EAR samples
+const MODEL_URL            = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
+const DETECTION_INTERVAL_MS = 200;   // Face detection tick rate
+const LIVENESS_TIMEOUT_S   = 30;     // Total time allowed for liveness
+const ANTI_SPOOF_INTERVAL  = 2;      // Run anti-spoof every N-th detection tick
+const ANTI_SPOOF_WARMUP    = 4;      // Skip anti-spoof for first N ticks (warm-up)
+const SPOOF_REJECT_COUNT   = 3;      // Consecutive "spoof" readings before rejection
 
-// Lip openness threshold (pixels)
-const LIP_OPEN_PX  = 6;             // Mouth open when inner lip gap > 6px
-const LIP_CLOSE_PX = 3;             // Mouth closed when gap < 3px
-
-// Head movement threshold (pixels)
-const HEAD_MOVE_PX = 8;             // Nose must shift >8px from baseline
-
-// ─── EAR helper ───────────────────────────────────────────────────────────────
-function ptDist(a: faceapi.Point, b: faceapi.Point) {
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
-
-// 6-point eye: [0]=outerCorner [1][2]=upper lid [3]=innerCorner [4][5]=lower lid
-function computeEAR(eye: faceapi.Point[]) {
-  const v1 = ptDist(eye[1], eye[5]);
-  const v2 = ptDist(eye[2], eye[4]);
-  const h  = ptDist(eye[0], eye[3]);
-  return (v1 + v2) / (2.0 * h);
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-interface LivenessState {
-  blinkDetected:         boolean;
-  lipMovementDetected:   boolean;
-  headMovementDetected:  boolean;
-  textureDetected:       boolean;
-}
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 type PageState =
   | "idle"
@@ -58,96 +66,91 @@ type PageState =
   | "camera-ready"
   | "monitoring"
   | "verifying"
-  | "otp"           // Face matched — waiting for OTP verification
+  | "otp"
   | "success"
   | "failed";
 
-// Active instruction shown to the user
-const INSTRUCTIONS = [
-  { key: "blinkDetected",        text: "👁  Please blink your eyes naturally" },
-  { key: "lipMovementDetected",  text: "👄  Open and close your mouth slightly" },
-  { key: "headMovementDetected", text: "↔️  Gently turn your head left or right" },
-  { key: "textureDetected",      text: "✅  Hold still — detecting skin texture…" },
-] as const;
+// ── Instruction sequence for liveness ─────────────────────────────────────────
 
-// ─── Component ────────────────────────────────────────────────────────────────
+const INSTRUCTIONS = [
+  { key: "blinkDetected"        as const, text: "👁  Please blink your eyes naturally" },
+  { key: "lipMovementDetected"  as const, text: "👄  Open and close your mouth slightly" },
+  { key: "headMovementDetected" as const, text: "↔️  Gently turn your head left or right" },
+  { key: "textureDetected"      as const, text: "✅  Hold still — detecting skin texture…" },
+];
+
+// ── Component ──────────────────────────────────────────────────────────────────
+
 export default function Login() {
-  const { login } = useUser();
+  const { login }    = useUser();
   const [, navigate] = useLocation();
+  const { toast }    = useToast();
+
+  // ── Page & auth state ────────────────────────────────────────────────────
   const [pageState,     setPageState]     = useState<PageState>("idle");
   const [email,         setEmail]         = useState("");
   const [modelsLoaded,  setModelsLoaded]  = useState(false);
-  const [liveness,      setLiveness]      = useState<LivenessState>({
-    blinkDetected: false, lipMovementDetected: false,
-    headMovementDetected: false, textureDetected: false,
-  });
-  const [timeLeft,      setTimeLeft]      = useState(LIVENESS_TIMEOUT_S);
   const [errorMsg,      setErrorMsg]      = useState("");
   const [successMsg,    setSuccessMsg]    = useState("");
   const [confidence,    setConfidence]    = useState<number | null>(null);
-
-  // Login mode
-  const [loginMode,     setLoginMode]     = useState<"face" | "password">("face");
-  const [pwInput,       setPwInput]       = useState("");
-  const [pwLoading,     setPwLoading]     = useState(false);
-  const [pwError,       setPwError]       = useState("");
   const [userName,      setUserName]      = useState("");
+  const [timeLeft,      setTimeLeft]      = useState(LIVENESS_TIMEOUT_S);
 
-  // OTP state
+  // ── Login mode ───────────────────────────────────────────────────────────
+  const [loginMode,  setLoginMode]  = useState<"face" | "password">("face");
+  const [pwInput,    setPwInput]    = useState("");
+  const [pwLoading,  setPwLoading]  = useState(false);
+  const [pwError,    setPwError]    = useState("");
+
+  // ── OTP state ────────────────────────────────────────────────────────────
   const [otpValue,      setOtpValue]      = useState("");
   const [otpError,      setOtpError]      = useState("");
   const [otpLoading,    setOtpLoading]    = useState(false);
-  const [otpResendLeft, setOtpResendLeft] = useState(0); // seconds until resend allowed
-  const [devOtp,        setDevOtp]        = useState<string | null>(null); // shown when no SMTP
-  const otpResendTimer  = useRef<ReturnType<typeof setInterval> | null>(null);
-  const storedOTP       = useRef<string>("");        // holds the generated OTP in memory
+  const [otpResendLeft, setOtpResendLeft] = useState(0);
+  const [devOtp,        setDevOtp]        = useState<string | null>(null);
+  const storedOTP      = useRef("");
+  const otpResendTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Live debug values (shown in monitoring mode)
-  const [debugEAR,      setDebugEAR]      = useState<number | null>(null);
-  const [debugLip,      setDebugLip]      = useState<number | null>(null);
+  // ── Stage 3: Liveness state (for UI rendering) ───────────────────────────
+  const [liveness, setLiveness] = useState<LivenessState>({
+    blinkDetected: false, lipMovementDetected: false,
+    headMovementDetected: false, textureDetected: false,
+  });
+  // Debug values for the developer panel
+  const [debugEAR, setDebugEAR] = useState<number | null>(null);
+  const [debugLip, setDebugLip] = useState<number | null>(null);
 
-  const { toast } = useToast();
+  // ── Stage 2: Anti-spoofing state (for UI rendering) ──────────────────────
+  const [antiSpoofScore,   setAntiSpoofScore]   = useState<number | null>(null);
+  const [antiSpoofSignals, setAntiSpoofSignals] = useState<SpoofSignals | null>(null);
+  const [spoofDetected,    setSpoofDetected]    = useState(false);
+
+  // ── Webcam ref ───────────────────────────────────────────────────────────
   const webcamRef = useRef<Webcam>(null);
 
-  // Interval handles
-  const detectionInterval = useRef<ReturnType<typeof setInterval> | null>(null);
-  const countdownInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  // ── Interval / lifecycle refs ────────────────────────────────────────────
+  const detectionInterval  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownInterval  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const monitoringActive   = useRef(false);
+  const detectionRunning   = useRef(false);
 
-  // Ref-copy of liveness so the interval callback always sees latest state
-  const livenessRef = useRef<LivenessState>(liveness);
-  useEffect(() => { livenessRef.current = liveness; }, [liveness]);
+  // ── Stage 2 & 3 engine refs ──────────────────────────────────────────────
+  // These are class instances so they hold their own state internally.
+  const livenessDetector   = useRef<LivenessDetector>(new LivenessDetector());
+  const antiSpoofEngine    = useRef<AntiSpoofEngine>(new AntiSpoofEngine());
 
-  // Ref so the interval can stop itself
-  const monitoringActive = useRef(false);
-  // Prevent overlapping async calls inside the interval
-  const detectionRunning = useRef(false);
+  // ── Per-session counters ─────────────────────────────────────────────────
+  const tickCount            = useRef(0);
+  const consecutiveSpoofCount= useRef(0);
+  const allPassedRef         = useRef(false); // used inside interval callbacks
 
-  // ── Blink: rolling EAR history for relative-drop detection ──────────────
-  // We keep the last N EAR values. A blink is when the latest reading drops
-  // to ≤75% of the rolling max (eyes-open baseline). No fixed threshold needed.
-  const earHistory = useRef<number[]>([]);
-
-  // ── Lip state machine ────────────────────────────────────────────────────
-  // Track whether we've seen both an open and a closed state
-  const lipWasOpen   = useRef(false);
-  const lipWasClosed = useRef(false);
-  // Remember the initial nose position as a baseline
-  const noseBaseline = useRef<{ x: number; y: number } | null>(null);
-
-  // ── Texture: pixel variance across several samples ───────────────────────
-  const offCanvas = useRef(document.createElement("canvas"));
-  const prevPixels = useRef<Uint8ClampedArray | null>(null);
-  const textureScores = useRef<number[]>([]);
-
-  // ─── Load models (once) ────────────────────────────────────────────────────
+  // ── Stage 1: Load face-api models ────────────────────────────────────────
   const loadModels = useCallback(async () => {
     if (modelsLoaded) { setPageState("camera-ready"); return; }
     setPageState("loading-models");
     try {
-      // Force CPU backend — avoids WebGL/WASM availability issues in iframes
       await faceapi.tf.setBackend("cpu");
       await faceapi.tf.ready();
-      // Load the three models we need for liveness + descriptor
       await Promise.all([
         faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
         faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
@@ -157,228 +160,179 @@ export default function Login() {
       setPageState("camera-ready");
     } catch (err) {
       console.error("Model load error:", err);
-      setErrorMsg("Failed to load AI models. Check your internet connection and refresh.");
+      setErrorMsg("Failed to load AI models. Check your connection and refresh.");
       setPageState("failed");
     }
   }, [modelsLoaded]);
 
-  // ─── Stop all intervals ────────────────────────────────────────────────────
+  // ── Stop all intervals ───────────────────────────────────────────────────
   const stopAll = useCallback(() => {
     monitoringActive.current = false;
-    if (detectionInterval.current) { clearInterval(detectionInterval.current); detectionInterval.current = null; }
-    if (countdownInterval.current) { clearInterval(countdownInterval.current); countdownInterval.current = null; }
+    if (detectionInterval.current)  { clearInterval(detectionInterval.current);  detectionInterval.current  = null; }
+    if (countdownInterval.current)  { clearInterval(countdownInterval.current);  countdownInterval.current  = null; }
   }, []);
 
-  // ─── Reset to camera-ready state ──────────────────────────────────────────
+  // ── Full reset → camera-ready ────────────────────────────────────────────
   const resetLiveness = useCallback(() => {
     stopAll();
-    const blank = { blinkDetected: false, lipMovementDetected: false, headMovementDetected: false, textureDetected: false };
+    // Reset both engine instances
+    livenessDetector.current.reset();
+    antiSpoofEngine.current.reset();
+    // Reset counters
+    tickCount.current             = 0;
+    consecutiveSpoofCount.current = 0;
+    allPassedRef.current          = false;
+    // Reset React state
+    const blank: LivenessState = {
+      blinkDetected: false, lipMovementDetected: false,
+      headMovementDetected: false, textureDetected: false,
+    };
     setLiveness(blank);
-    livenessRef.current = blank;
-    earHistory.current   = [];
-    storedOTP.current    = "";
-    lipWasOpen.current   = false;
-    lipWasClosed.current = false;
-    noseBaseline.current = null;
-    prevPixels.current   = null;
-    textureScores.current = [];
+    setSpoofDetected(false);
+    setAntiSpoofScore(null);
+    setAntiSpoofSignals(null);
     setDebugEAR(null);
     setDebugLip(null);
     setTimeLeft(LIVENESS_TIMEOUT_S);
     setErrorMsg("");
     setSuccessMsg("");
     setConfidence(null);
+    storedOTP.current = "";
     setPageState("camera-ready");
   }, [stopAll]);
 
-  // ─── Single detection tick (called by interval) ────────────────────────────
+  // ── Single detection tick ────────────────────────────────────────────────
+  // Called every DETECTION_INTERVAL_MS while monitoring is active.
   const runDetectionTick = useCallback(async () => {
-    // Guard: skip if already running or monitoring stopped
     if (detectionRunning.current || !monitoringActive.current) return;
+
     const video = webcamRef.current?.video;
     if (!video || video.readyState !== 4) return;
 
     detectionRunning.current = true;
+    tickCount.current++;
+
     try {
-      // During liveness monitoring we only need landmarks — NOT the descriptor.
-      // Skipping withFaceDescriptor() makes each tick 3–4× faster on CPU.
+      // ── STAGE 1: Face Detection ──────────────────────────────────────────
+      // Request only landmarks here (no descriptor) — 3-4× faster on CPU.
       const det = await faceapi
-        .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
+        .detectSingleFace(
+          video,
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 })
+        )
         .withFaceLandmarks();
 
-      if (det) {
-        const pts = det.landmarks.positions;
+      // ── STAGE 2: Anti-Spoofing ───────────────────────────────────────────
+      // Run every ANTI_SPOOF_INTERVAL ticks after the warm-up period.
+      const shouldRunAntiSpoof =
+        tickCount.current > ANTI_SPOOF_WARMUP &&
+        tickCount.current % ANTI_SPOOF_INTERVAL === 0;
 
-        // ── 1. EYE BLINK ────────────────────────────────────────────────────
-        // 68-point map: left eye = pts[36..41], right eye = pts[42..47]
-        const leftEye  = pts.slice(36, 42) as faceapi.Point[];
-        const rightEye = pts.slice(42, 48) as faceapi.Point[];
-        const ear = (computeEAR(leftEye) + computeEAR(rightEye)) / 2;
-        setDebugEAR(Math.round(ear * 1000) / 1000);
-
-        if (!livenessRef.current.blinkDetected) {
-          // Push into rolling history
-          earHistory.current.push(ear);
-          if (earHistory.current.length > EAR_HISTORY_SIZE) earHistory.current.shift();
-
-          // Need at least 4 samples to establish an open-eye baseline
-          if (earHistory.current.length >= 4) {
-            // Rolling max = the highest EAR seen recently (open eyes baseline)
-            const rollingMax = Math.max(...earHistory.current);
-
-            // A blink = current EAR drops to ≤75% of the open-eye baseline.
-            // Require the baseline to be meaningful (> 0.15) to avoid false positives
-            // when no face is present.
-            if (rollingMax > 0.15 && ear <= rollingMax * BLINK_DROP_RATIO) {
-              setLiveness(prev => ({ ...prev, blinkDetected: true }));
-              earHistory.current = []; // reset so it doesn't re-trigger
+      if (shouldRunAntiSpoof) {
+        // Provide face bounding box when available for a tighter crop
+        const bounds = det
+          ? {
+              x:      Math.max(0, det.detection.box.x),
+              y:      Math.max(0, det.detection.box.y),
+              width:  Math.min(det.detection.box.width,  video.videoWidth),
+              height: Math.min(det.detection.box.height, video.videoHeight),
             }
-          }
-        }
+          : undefined;
 
-        // ── 2. LIP MOVEMENT ─────────────────────────────────────────────────
-        // Inner mouth: pts[60..67]. Vertical gap = pts[62] (top) vs pts[66] (bottom)
-        const lipGap = Math.abs(pts[62].y - pts[66].y);
-        setDebugLip(Math.round(lipGap));
+        const spoofResult = antiSpoofEngine.current.analyze(video, bounds);
 
-        if (!livenessRef.current.lipMovementDetected) {
-          if (lipGap > LIP_OPEN_PX)  lipWasOpen.current   = true;
-          if (lipGap < LIP_CLOSE_PX) lipWasClosed.current = true;
-          // Must have seen BOTH open and closed to count as deliberate movement
-          if (lipWasOpen.current && lipWasClosed.current) {
-            setLiveness(prev => ({ ...prev, lipMovementDetected: true }));
-          }
-        }
+        // Update UI state
+        setAntiSpoofScore(spoofResult.score);
+        setAntiSpoofSignals(spoofResult.signals);
 
-        // ── 3. HEAD MOVEMENT ─────────────────────────────────────────────────
-        // Use nose tip (pt[30]) relative to a baseline captured at first frame
-        const nosePt = pts[30];
-        if (!livenessRef.current.headMovementDetected) {
-          if (!noseBaseline.current) {
-            noseBaseline.current = { x: nosePt.x, y: nosePt.y };
-          } else {
-            const dx = Math.abs(nosePt.x - noseBaseline.current.x);
-            const dy = Math.abs(nosePt.y - noseBaseline.current.y);
-            if (dx > HEAD_MOVE_PX || dy > HEAD_MOVE_PX) {
-              setLiveness(prev => ({ ...prev, headMovementDetected: true }));
-            }
+        if (!spoofResult.isReal) {
+          consecutiveSpoofCount.current++;
+          // Require SPOOF_REJECT_COUNT consecutive failures before rejecting
+          // to avoid false positives from individual noisy frames.
+          if (consecutiveSpoofCount.current >= SPOOF_REJECT_COUNT) {
+            stopAll();
+            setSpoofDetected(true);
+            setErrorMsg("Spoofing attempt detected. Please use a real face.");
+            setPageState("failed");
+            return;
           }
+        } else {
+          // Reset on any genuine-looking frame
+          consecutiveSpoofCount.current = 0;
         }
       }
 
-      // ── 4. SKIN TEXTURE (temporal pixel variance) ──────────────────────────
-      // Run on raw video — no face needed. Measures frame-to-frame variation
-      // which is always present for real video but flat for static photos.
-      if (!livenessRef.current.textureDetected) {
-        const ctx = offCanvas.current.getContext("2d");
-        if (ctx) {
-          offCanvas.current.width  = 48;
-          offCanvas.current.height = 48;
-          ctx.drawImage(video, 0, 0, 48, 48);
-          const imgData = ctx.getImageData(0, 0, 48, 48).data;
-          const gray = new Uint8ClampedArray(48 * 48);
-          for (let i = 0; i < gray.length; i++) {
-            gray[i] = Math.round(0.299 * imgData[i*4] + 0.587 * imgData[i*4+1] + 0.114 * imgData[i*4+2]);
-          }
+      // ── STAGE 3: Liveness Detection ──────────────────────────────────────
+      const livenessResult = livenessDetector.current.update(det ?? null, video);
 
-          if (prevPixels.current) {
-            let mad = 0;
-            for (let i = 0; i < gray.length; i++) mad += Math.abs(gray[i] - prevPixels.current[i]);
-            mad /= gray.length;
+      // Sync React state for rendering (only update when something changed)
+      setLiveness(prev => {
+        const s = livenessResult.state;
+        if (
+          prev.blinkDetected         === s.blinkDetected &&
+          prev.lipMovementDetected   === s.lipMovementDetected &&
+          prev.headMovementDetected  === s.headMovementDetected &&
+          prev.textureDetected       === s.textureDetected
+        ) return prev;
+        return { ...s };
+      });
 
-            // Accumulate scores; pass after 4 samples with variation > threshold
-            textureScores.current.push(mad);
-            const recentScores = textureScores.current.slice(-6);
-            const passing = recentScores.filter(s => s > 1.2).length;
-            if (passing >= 4) {
-              setLiveness(prev => ({ ...prev, textureDetected: true }));
-            }
-          }
-          prevPixels.current = gray;
-        }
+      if (livenessResult.ear    !== null) setDebugEAR(Math.round(livenessResult.ear    * 1000) / 1000);
+      if (livenessResult.lipGap !== null) setDebugLip(Math.round(livenessResult.lipGap));
+
+      // Keep allPassedRef in sync so the countdown callback can read it
+      allPassedRef.current = livenessResult.allPassed;
+
+      // ── Auto-complete: all liveness checks passed ─────────────────────────
+      if (livenessResult.allPassed && monitoringActive.current) {
+        stopAll();
+        // Stage 4 (face recognition) starts here
+        verifyAndLogin();
       }
 
-    } catch (err) {
-      // Silently ignore individual frame errors — next tick will retry
+    } catch {
+      // Silently swallow individual frame errors; next tick will retry.
     } finally {
       detectionRunning.current = false;
     }
-  }, []);
+  // verifyAndLogin is defined below; useCallback dependency handled via ref
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stopAll]);
 
-  // ─── Check if all liveness passed and auto-verify ─────────────────────────
-  const allPassed = (l: LivenessState) =>
-    l.blinkDetected && l.lipMovementDetected && l.headMovementDetected && l.textureDetected;
+  // Keep a ref to verifyAndLogin so runDetectionTick can call the latest version
+  const verifyAndLoginRef = useRef<() => void>(() => {});
 
-  useEffect(() => {
-    if (pageState === "monitoring" && allPassed(liveness)) {
-      stopAll();
-      verifyAndLogin();
-    }
-  }, [liveness, pageState]);
-
-  // ─── Start liveness monitoring ─────────────────────────────────────────────
-  const startMonitoring = useCallback(() => {
-    if (!email.trim()) {
-      toast({ variant: "destructive", title: "Email required", description: "Enter your email first." });
-      return;
-    }
-    monitoringActive.current = true;
-    setPageState("monitoring");
-    setTimeLeft(LIVENESS_TIMEOUT_S);
-
-    // Countdown — 1 tick per second
-    countdownInterval.current = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 1) {
-          stopAll();
-          if (!allPassed(livenessRef.current)) {
-            setErrorMsg("Time expired. Not all liveness checks were completed. Please try again.");
-            setPageState("failed");
-          }
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    // Face detection — every 350ms (much gentler on CPU than rAF)
-    detectionInterval.current = setInterval(runDetectionTick, DETECTION_INTERVAL_MS);
-
-    // Run immediately on the first tick too
-    runDetectionTick();
-  }, [email, runDetectionTick, stopAll, toast]);
-
-  // ─── Final face capture + backend call ────────────────────────────────────
+  // ── Stage 4: Face Recognition ─────────────────────────────────────────────
   const verifyAndLogin = useCallback(async () => {
     setPageState("verifying");
     const video = webcamRef.current?.video;
     if (!video) { setErrorMsg("Camera unavailable."); setPageState("failed"); return; }
 
     try {
-      // Capture 3 frames and average the descriptors — much more robust than a single capture.
-      // This smooths out noise from lighting/angle variation between frames.
-      const SAMPLES = 3;
+      // Capture 3 frames and average descriptors — smooths noise from
+      // lighting/angle variation between individual captures.
+      const SAMPLES     = 3;
       const descriptors: Float32Array[] = [];
 
       for (let i = 0; i < SAMPLES; i++) {
-        // Small delay between captures to let the camera frame refresh
         if (i > 0) await new Promise(r => setTimeout(r, 300));
-
         const det = await faceapi
-          .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 }))
+          .detectSingleFace(
+            video,
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.4 })
+          )
           .withFaceLandmarks()
           .withFaceDescriptor();
-
         if (det) descriptors.push(det.descriptor);
       }
 
       if (descriptors.length === 0) {
-        setErrorMsg("No face detected at verification time. Please look directly at the camera and try again.");
+        setErrorMsg("No face detected at verification time. Look directly at the camera and try again.");
         setPageState("failed");
         return;
       }
 
-      // Average the captured descriptors
+      // Average the captured descriptors into one representative vector
       const avgDescriptor = new Float32Array(128);
       for (const d of descriptors) {
         for (let j = 0; j < 128; j++) avgDescriptor[j] += d[j];
@@ -386,9 +340,9 @@ export default function Login() {
       for (let j = 0; j < 128; j++) avgDescriptor[j] /= descriptors.length;
 
       const res = await fetch("/api/login-face", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body:    JSON.stringify({
           email,
           face_descriptor: Array.from(avgDescriptor),
           liveness_passed: true,
@@ -397,11 +351,10 @@ export default function Login() {
       const data = await res.json();
 
       if (res.ok) {
-        // Face matched — now trigger OTP step
         setConfidence(data.confidence ?? null);
         setUserName(data.name ?? "");
         setPageState("otp");
-        // Fire and forget — don't await so we can get to OTP UI quickly
+        // Start OTP flow asynchronously so OTP UI appears immediately
         sendOtp();
       } else {
         setErrorMsg(data.error || "Authentication failed.");
@@ -413,7 +366,125 @@ export default function Login() {
     }
   }, [email]);
 
-  // ─── OTP helpers ─────────────────────────────────────────────────────────
+  // Keep ref in sync with the latest verifyAndLogin so the detection tick can call it
+  useEffect(() => { verifyAndLoginRef.current = verifyAndLogin; }, [verifyAndLogin]);
+
+  // Patch runDetectionTick to call via ref (avoids stale closure)
+  const runDetectionTickPatched = useCallback(async () => {
+    if (detectionRunning.current || !monitoringActive.current) return;
+    const video = webcamRef.current?.video;
+    if (!video || video.readyState !== 4) return;
+
+    detectionRunning.current = true;
+    tickCount.current++;
+
+    try {
+      const det = await faceapi
+        .detectSingleFace(
+          video,
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 })
+        )
+        .withFaceLandmarks();
+
+      // ── STAGE 2: Anti-Spoofing ───────────────────────────────────────────
+      const shouldRunAntiSpoof =
+        tickCount.current > ANTI_SPOOF_WARMUP &&
+        tickCount.current % ANTI_SPOOF_INTERVAL === 0;
+
+      if (shouldRunAntiSpoof) {
+        const bounds = det
+          ? {
+              x:      Math.max(0, det.detection.box.x),
+              y:      Math.max(0, det.detection.box.y),
+              width:  Math.min(det.detection.box.width,  video.videoWidth),
+              height: Math.min(det.detection.box.height, video.videoHeight),
+            }
+          : undefined;
+
+        const spoofResult = antiSpoofEngine.current.analyze(video, bounds);
+        setAntiSpoofScore(spoofResult.score);
+        setAntiSpoofSignals(spoofResult.signals);
+
+        if (!spoofResult.isReal) {
+          consecutiveSpoofCount.current++;
+          if (consecutiveSpoofCount.current >= SPOOF_REJECT_COUNT) {
+            stopAll();
+            setSpoofDetected(true);
+            setErrorMsg("Spoofing attempt detected. Please use a real face.");
+            setPageState("failed");
+            return;
+          }
+        } else {
+          consecutiveSpoofCount.current = 0;
+        }
+      }
+
+      // ── STAGE 3: Liveness ────────────────────────────────────────────────
+      const livenessResult = livenessDetector.current.update(det ?? null, video);
+
+      setLiveness(prev => {
+        const s = livenessResult.state;
+        if (
+          prev.blinkDetected         === s.blinkDetected &&
+          prev.lipMovementDetected   === s.lipMovementDetected &&
+          prev.headMovementDetected  === s.headMovementDetected &&
+          prev.textureDetected       === s.textureDetected
+        ) return prev;
+        return { ...s };
+      });
+
+      if (livenessResult.ear    !== null) setDebugEAR(Math.round(livenessResult.ear    * 1000) / 1000);
+      if (livenessResult.lipGap !== null) setDebugLip(Math.round(livenessResult.lipGap));
+
+      allPassedRef.current = livenessResult.allPassed;
+
+      // ── STAGE 4 trigger ───────────────────────────────────────────────────
+      if (livenessResult.allPassed && monitoringActive.current) {
+        stopAll();
+        verifyAndLoginRef.current();
+      }
+
+    } catch {
+      // Ignore individual frame errors
+    } finally {
+      detectionRunning.current = false;
+    }
+  }, [stopAll]);
+
+  // ── Start liveness monitoring ─────────────────────────────────────────────
+  const startMonitoring = useCallback(() => {
+    if (!email.trim()) {
+      toast({ variant: "destructive", title: "Email required", description: "Enter your email first." });
+      return;
+    }
+
+    monitoringActive.current = true;
+    setPageState("monitoring");
+    setTimeLeft(LIVENESS_TIMEOUT_S);
+
+    // Countdown — 1 tick per second
+    countdownInterval.current = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          stopAll();
+          if (!allPassedRef.current) {
+            setErrorMsg("Time expired. Complete all liveness checks before the timer runs out.");
+            setPageState("failed");
+          }
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    // Face detection — every DETECTION_INTERVAL_MS
+    detectionInterval.current = setInterval(runDetectionTickPatched, DETECTION_INTERVAL_MS);
+
+    // Kick off first tick immediately
+    runDetectionTickPatched();
+  }, [email, runDetectionTickPatched, stopAll, toast]);
+
+  // ── Stage 5: OTP helpers ──────────────────────────────────────────────────
   const startOtpResendCountdown = useCallback((seconds = 60) => {
     setOtpResendLeft(seconds);
     if (otpResendTimer.current) clearInterval(otpResendTimer.current);
@@ -428,19 +499,11 @@ export default function Login() {
   const sendOtp = useCallback(async () => {
     setOtpError("");
     setDevOtp(null);
-
-    // Generate a fresh 6-digit OTP and store it in memory
     const otp = generateOTP();
     storedOTP.current = otp;
-
-    // Send via EmailJS (frontend) — no backend call needed
     const result = await sendOTPEmail(email, otp);
-
     if (result.ok) {
-      // If EmailJS is not configured, show the OTP in the UI for dev testing
-      if (!emailJSConfigured) {
-        setDevOtp(otp);
-      }
+      if (!emailJSConfigured) setDevOtp(otp);
       startOtpResendCountdown(60);
     } else {
       setOtpError(result.error ?? "Failed to send OTP email");
@@ -449,57 +512,37 @@ export default function Login() {
 
   const verifyOtp = useCallback(async () => {
     const entered = otpValue.trim();
-    if (entered.length !== 6) {
-      setOtpError("Please enter the full 6-digit code.");
-      return;
-    }
-    if (!storedOTP.current) {
-      setOtpError("No OTP found. Please request a new one.");
-      return;
-    }
+    if (entered.length !== 6) { setOtpError("Please enter the full 6-digit code."); return; }
+    if (!storedOTP.current)   { setOtpError("No OTP found. Please request a new one."); return; }
 
     setOtpLoading(true);
     setOtpError("");
-
-    // Small artificial delay so the button doesn't flash instantly
     await new Promise(r => setTimeout(r, 400));
 
     if (entered === storedOTP.current) {
-      // Clear OTP from memory so it can't be reused
       storedOTP.current = "";
       if (otpResendTimer.current) clearInterval(otpResendTimer.current);
-      // Store user and redirect to dashboard
       login(email, userName || undefined);
       navigate("/dashboard");
     } else {
       setOtpError("Incorrect code. Please check and try again.");
     }
-
     setOtpLoading(false);
-  }, [otpValue]);
+  }, [otpValue, email, userName, login, navigate]);
 
-  // ─── Cleanup on unmount ───────────────────────────────────────────────────
-  useEffect(() => () => {
-    stopAll();
-    if (otpResendTimer.current) clearInterval(otpResendTimer.current);
-  }, [stopAll]);
-
-  // ─── Password login ───────────────────────────────────────────────────────
+  // ── Password login ────────────────────────────────────────────────────────
   const handlePasswordLogin = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     setPwError("");
     setPwLoading(true);
     try {
-      const res = await fetch("/api/login", {
-        method: "POST",
+      const res  = await fetch("/api/login", {
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password: pwInput }),
+        body:    JSON.stringify({ email, password: pwInput }),
       });
       const data = await res.json();
-      if (!res.ok) {
-        setPwError(data.error || "Login failed. Please try again.");
-        return;
-      }
+      if (!res.ok) { setPwError(data.error || "Login failed. Please try again."); return; }
       login(email, data.name ?? undefined);
       navigate("/dashboard");
     } catch {
@@ -509,24 +552,36 @@ export default function Login() {
     }
   }, [email, pwInput, login, navigate]);
 
-  // ─── Derived values ───────────────────────────────────────────────────────
-  const passedCount = Object.values(liveness).filter(Boolean).length;
+  // ── Cleanup on unmount ────────────────────────────────────────────────────
+  useEffect(() => () => {
+    stopAll();
+    if (otpResendTimer.current) clearInterval(otpResendTimer.current);
+  }, [stopAll]);
 
-  // Active instruction: first uncompleted check
-  const activeInstruction = pageState === "monitoring"
-    ? INSTRUCTIONS.find(i => !liveness[i.key as keyof LivenessState])?.text ?? "✅ All checks done!"
+  // ── Derived display values ────────────────────────────────────────────────
+  const passedCount        = Object.values(liveness).filter(Boolean).length;
+  const activeInstruction  = pageState === "monitoring"
+    ? INSTRUCTIONS.find(i => !liveness[i.key])?.text ?? "✅ All checks done!"
     : null;
 
   const checks = [
-    { key: "blinkDetected"       as const, label: "Eye Blink",        icon: Eye,    hint: "Please blink your eyes" },
-    { key: "lipMovementDetected" as const, label: "Lip Movement",     icon: Smile,  hint: "Open and close your mouth" },
-    { key: "headMovementDetected"as const, label: "Head Movement",    icon: Move,   hint: "Move your head slightly" },
-    { key: "textureDetected"     as const, label: "Real Skin Texture",icon: Layers, hint: "Hold still in frame" },
+    { key: "blinkDetected"        as const, label: "Eye Blink",         icon: Eye,    hint: "Please blink your eyes" },
+    { key: "lipMovementDetected"  as const, label: "Lip Movement",      icon: Smile,  hint: "Open and close your mouth" },
+    { key: "headMovementDetected" as const, label: "Head Movement",     icon: Move,   hint: "Move your head slightly" },
+    { key: "textureDetected"      as const, label: "Real Skin Texture", icon: Layers, hint: "Hold still in frame" },
   ];
 
-  // ─── Render ───────────────────────────────────────────────────────────────
+  // Anti-spoof shield colour tier
+  const shieldColor =
+    antiSpoofScore === null  ? "text-gray-400 border-white/10 bg-white/3" :
+    antiSpoofScore >= 65     ? "text-green-400 border-green-500/30 bg-green-500/8" :
+    antiSpoofScore >= 40     ? "text-yellow-400 border-yellow-500/30 bg-yellow-500/8" :
+                               "text-red-400 border-red-500/30 bg-red-500/8";
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen flex flex-col relative overflow-hidden bg-background">
+      {/* Background glows */}
       <div className="fixed inset-0 z-0 pointer-events-none">
         <div className="absolute top-[5%] left-[5%] w-[45%] h-[45%] rounded-full bg-indigo-600/5 blur-[120px]" />
         <div className="absolute bottom-[5%] right-[5%] w-[40%] h-[40%] rounded-full bg-purple-600/5 blur-[100px]" />
@@ -537,7 +592,7 @@ export default function Login() {
       <main className="flex-1 container mx-auto px-4 py-24 md:py-28 relative z-10">
         <div className="w-full max-w-6xl mx-auto">
 
-          {/* Header */}
+          {/* ── Page Header ───────────────────────────────────────────── */}
           <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="text-center mb-10">
             <h1 className="text-4xl md:text-5xl font-display font-bold text-white mb-3">
               Biometric{" "}
@@ -546,76 +601,56 @@ export default function Login() {
               </span>
             </h1>
             <p className="text-muted-foreground max-w-xl mx-auto">
-              The system verifies you're a real person using four liveness signals before granting access.
+              Multi-layer authentication: anti-spoofing, liveness detection, face recognition and OTP.
             </p>
           </motion.div>
 
-          {/* ── Login Mode Tab Switcher ─────────────────────────────── */}
+          {/* ── Login Mode Tab Switcher ────────────────────────────────── */}
           {pageState === "idle" && (
-            <motion.div
-              initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
-              className="flex justify-center mb-8"
-            >
+            <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="flex justify-center mb-8">
               <div className="flex gap-1 p-1 rounded-2xl bg-white/5 border border-white/10">
-                <button
-                  onClick={() => { setLoginMode("face"); setPwError(""); }}
-                  className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 ${
-                    loginMode === "face"
-                      ? "bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-[0_0_20px_rgba(99,102,241,0.3)]"
-                      : "text-muted-foreground hover:text-white"
-                  }`}
-                >
-                  Face Login
-                </button>
-                <button
-                  onClick={() => { setLoginMode("password"); setPwError(""); }}
-                  className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 ${
-                    loginMode === "password"
-                      ? "bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-[0_0_20px_rgba(99,102,241,0.3)]"
-                      : "text-muted-foreground hover:text-white"
-                  }`}
-                >
-                  Password Login
-                </button>
+                {(["face", "password"] as const).map(mode => (
+                  <button
+                    key={mode}
+                    onClick={() => { setLoginMode(mode); setPwError(""); }}
+                    className={`px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-200 ${
+                      loginMode === mode
+                        ? "bg-gradient-to-r from-indigo-500 to-purple-600 text-white shadow-[0_0_20px_rgba(99,102,241,0.3)]"
+                        : "text-muted-foreground hover:text-white"
+                    }`}
+                  >
+                    {mode === "face" ? "Face Login" : "Password Login"}
+                  </button>
+                ))}
               </div>
             </motion.div>
           )}
 
-          {/* ── Password Login Form ──────────────────────────────────── */}
+          {/* ── Password Login Form ────────────────────────────────────── */}
           {loginMode === "password" && pageState === "idle" && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }}
-              className="max-w-md mx-auto"
-            >
+            <motion.div initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }} className="max-w-md mx-auto">
               <div className="glass-panel rounded-3xl p-8 border-white/10">
                 <h2 className="text-2xl font-bold text-white mb-1">Sign In</h2>
                 <p className="text-gray-400 text-sm mb-7">Enter your email and password to access your account.</p>
-
                 <form onSubmit={handlePasswordLogin} className="space-y-5">
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-gray-300 ml-1">Email Address</label>
                     <input
-                      type="email"
-                      required
-                      value={email}
-                      onChange={(e) => { setEmail(e.target.value); setPwError(""); }}
+                      type="email" required value={email}
+                      onChange={e => { setEmail(e.target.value); setPwError(""); }}
                       className="w-full px-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
                       placeholder="you@example.com"
                     />
                   </div>
-
                   <div className="space-y-2">
                     <label className="text-sm font-medium text-gray-300 ml-1">Password</label>
                     <input
-                      type="password"
-                      required
-                      value={pwInput}
-                      onChange={(e) => { setPwInput(e.target.value); setPwError(""); }}
+                      type="password" required value={pwInput}
+                      onChange={e => { setPwInput(e.target.value); setPwError(""); }}
                       className="w-full px-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
                       placeholder="••••••••••••"
                     />
                   </div>
-
                   <AnimatePresence>
                     {pwError && (
                       <motion.div
@@ -627,42 +662,28 @@ export default function Login() {
                       </motion.div>
                     )}
                   </AnimatePresence>
-
                   <button
-                    type="submit"
-                    disabled={pwLoading}
+                    type="submit" disabled={pwLoading}
                     className="w-full py-4 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-500 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-60 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 transition-all duration-200 flex items-center justify-center gap-2"
                   >
-                    {pwLoading ? (
-                      <><Loader2 className="w-5 h-5 animate-spin" /> Signing in...</>
-                    ) : (
-                      <><ShieldCheck className="w-5 h-5" /> Sign In</>
-                    )}
+                    {pwLoading ? <><Loader2 className="w-5 h-5 animate-spin" /> Signing in...</> : <><ShieldCheck className="w-5 h-5" /> Sign In</>}
                   </button>
-
                   <p className="text-center text-sm text-muted-foreground pt-1">
                     Don't have an account?{" "}
-                    <a href="/register" className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors">
-                      Register
-                    </a>
+                    <a href="/register" className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors">Register</a>
                   </p>
                 </form>
               </div>
             </motion.div>
           )}
 
-          {/* ── OTP Screen ─────────────────────────────────────────────── */}
+          {/* ── OTP Screen ────────────────────────────────────────────── */}
           {pageState === "otp" && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}
-              className="max-w-md mx-auto"
-            >
+            <motion.div initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} className="max-w-md mx-auto">
               <div className="glass-panel rounded-3xl p-8 border-white/10 text-center">
-                {/* Icon */}
                 <div className="w-16 h-16 rounded-2xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center mx-auto mb-5 shadow-[0_0_30px_rgba(99,102,241,0.2)]">
                   <ShieldCheck className="w-8 h-8 text-indigo-400" />
                 </div>
-
                 <h2 className="text-2xl font-bold text-white mb-1">Two-Factor Verification</h2>
                 <p className="text-gray-400 text-sm mb-6">
                   Face verified.{" "}
@@ -672,12 +693,11 @@ export default function Login() {
                   }
                 </p>
 
-                {/* Dev mode OTP hint (shown when EmailJS not configured) */}
                 {devOtp && (
                   <div className="mb-5 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/25 text-yellow-300 text-sm text-left">
                     <p className="font-semibold mb-1">Development Mode</p>
                     <p className="text-xs text-yellow-400/80 mb-2">
-                      EmailJS is not configured. Set <code className="text-yellow-300">VITE_EMAILJS_SERVICE_ID</code>,{" "}
+                      Set <code className="text-yellow-300">VITE_EMAILJS_SERVICE_ID</code>,{" "}
                       <code className="text-yellow-300">VITE_EMAILJS_TEMPLATE_ID</code>, and{" "}
                       <code className="text-yellow-300">VITE_EMAILJS_PUBLIC_KEY</code> to enable real emails.
                     </p>
@@ -688,11 +708,8 @@ export default function Login() {
                   </div>
                 )}
 
-                {/* 6-digit OTP input */}
                 <input
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={6}
+                  type="text" inputMode="numeric" maxLength={6}
                   value={otpValue}
                   onChange={e => { setOtpValue(e.target.value.replace(/\D/g, "")); setOtpError(""); }}
                   onKeyDown={e => e.key === "Enter" && verifyOtp()}
@@ -700,7 +717,6 @@ export default function Login() {
                   placeholder="______"
                 />
 
-                {/* Error */}
                 {otpError && (
                   <motion.p
                     initial={{ opacity: 0 }} animate={{ opacity: 1 }}
@@ -710,29 +726,22 @@ export default function Login() {
                   </motion.p>
                 )}
 
-                {/* Verify button */}
                 <button
-                  onClick={verifyOtp}
-                  disabled={otpLoading || otpValue.length !== 6}
+                  onClick={verifyOtp} disabled={otpLoading || otpValue.length !== 6}
                   className="w-full py-3.5 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 transition-all flex items-center justify-center gap-2 mb-5"
                 >
                   {otpLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <ShieldCheck className="w-5 h-5" />}
                   {otpLoading ? "Verifying…" : "Verify OTP"}
                 </button>
 
-                {/* Resend */}
                 <div className="flex items-center justify-center gap-2 text-sm">
                   {otpResendLeft > 0 ? (
                     <span className="text-gray-500">
-                      Resend available in <span className="text-indigo-400 font-mono font-semibold">{otpResendLeft}s</span>
+                      Resend in <span className="text-indigo-400 font-mono font-semibold">{otpResendLeft}s</span>
                     </span>
                   ) : (
-                    <button
-                      onClick={sendOtp}
-                      className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors flex items-center gap-1.5"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      Resend OTP
+                    <button onClick={sendOtp} className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors flex items-center gap-1.5">
+                      <RefreshCw className="w-3.5 h-3.5" /> Resend OTP
                     </button>
                   )}
                 </div>
@@ -740,12 +749,9 @@ export default function Login() {
             </motion.div>
           )}
 
-          {/* ── Final Success Screen ────────────────────────────────────── */}
+          {/* ── Success Screen ─────────────────────────────────────────── */}
           {pageState === "success" && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }}
-              className="max-w-md mx-auto"
-            >
+            <motion.div initial={{ opacity: 0, scale: 0.96 }} animate={{ opacity: 1, scale: 1 }} className="max-w-md mx-auto">
               <div className="glass-panel rounded-3xl p-10 border-green-500/20 bg-green-500/5 text-center">
                 <motion.div
                   initial={{ scale: 0 }} animate={{ scale: 1 }}
@@ -769,408 +775,465 @@ export default function Login() {
                     <p className="text-green-400 text-sm font-semibold mt-1">{confidence}% match</p>
                   </div>
                 )}
-                <button
-                  onClick={resetLiveness}
-                  className="w-full py-3 rounded-xl font-bold text-white bg-white/8 hover:bg-white/12 border border-white/15 transition-all text-sm"
-                >
+                <button onClick={resetLiveness} className="w-full py-3 rounded-xl font-bold text-white bg-white/8 hover:bg-white/12 border border-white/15 transition-all text-sm">
                   Sign in with another account
                 </button>
               </div>
             </motion.div>
           )}
 
-          {/* ── Two-column face auth layout ─────────────────────────────── */}
-          {loginMode === "face" && !["otp","success"].includes(pageState) && <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
+          {/* ── Two-column face auth layout ────────────────────────────── */}
+          {loginMode === "face" && !["otp", "success"].includes(pageState) && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
 
-            {/* ── LEFT: Camera ─────────────────────────────────────────────── */}
-            <motion.div initial={{ opacity: 0, x: -30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1 }} className="flex flex-col gap-4">
+              {/* ── LEFT: Camera ─────────────────────────────────────────── */}
+              <motion.div initial={{ opacity: 0, x: -30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1 }} className="flex flex-col gap-4">
 
-              {/* Camera box */}
-              <div className="glass-panel rounded-3xl overflow-hidden border-white/10 bg-black/60 relative">
-                <div className="aspect-[4/3] relative">
+                {/* Camera box */}
+                <div className="glass-panel rounded-3xl overflow-hidden border-white/10 bg-black/60 relative">
+                  <div className="aspect-[4/3] relative">
 
-                  {/* Webcam — mounted whenever camera is needed */}
-                  {["camera-ready","monitoring","verifying","success"].includes(pageState) && (
-                    <Webcam
-                      audio={false}
-                      ref={webcamRef}
-                      screenshotFormat="image/jpeg"
-                      videoConstraints={{ facingMode: "user", width: 640, height: 480 }}
-                      className="w-full h-full object-cover"
-                      mirrored
-                    />
-                  )}
+                    {/* Live webcam feed */}
+                    {["camera-ready", "monitoring", "verifying", "success"].includes(pageState) && (
+                      <Webcam
+                        audio={false} ref={webcamRef}
+                        screenshotFormat="image/jpeg"
+                        videoConstraints={{ facingMode: "user", width: 640, height: 480 }}
+                        className="w-full h-full object-cover" mirrored
+                      />
+                    )}
 
-                  {/* Idle / loading */}
-                  {["idle","loading-models"].includes(pageState) && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/90 z-20">
-                      {pageState === "loading-models" ? (
-                        <>
-                          <Loader2 className="w-10 h-10 text-indigo-400 animate-spin mb-4" />
-                          <p className="text-indigo-300 text-sm tracking-widest uppercase font-medium">
-                            Loading Neural Networks…
-                          </p>
-                        </>
-                      ) : (
-                        <>
-                          <div className="w-20 h-20 rounded-full bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center mb-4">
-                            <User className="w-10 h-10 text-indigo-400" />
+                    {/* Idle / loading model overlay */}
+                    {["idle", "loading-models"].includes(pageState) && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/90 z-20">
+                        {pageState === "loading-models" ? (
+                          <>
+                            <Loader2 className="w-10 h-10 text-indigo-400 animate-spin mb-4" />
+                            <p className="text-indigo-300 text-sm tracking-widest uppercase font-medium">Loading Neural Networks…</p>
+                          </>
+                        ) : (
+                          <>
+                            <div className="w-20 h-20 rounded-full bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center mb-4">
+                              <User className="w-10 h-10 text-indigo-400" />
+                            </div>
+                            <p className="text-white/50 text-sm">Camera starts after model load</p>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Monitoring overlay: scan frame + instruction banner */}
+                    {pageState === "monitoring" && (
+                      <div className="absolute inset-0 z-20 pointer-events-none">
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <div className="w-44 h-60 border-2 border-indigo-400/40 rounded-[40px] relative">
+                            <div className="absolute -top-1 -left-1  w-5 h-5 border-t-2 border-l-2 border-indigo-400" />
+                            <div className="absolute -top-1 -right-1 w-5 h-5 border-t-2 border-r-2 border-indigo-400" />
+                            <div className="absolute -bottom-1 -left-1  w-5 h-5 border-b-2 border-l-2 border-indigo-400" />
+                            <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-2 border-r-2 border-indigo-400" />
+                            <motion.div
+                              animate={{ top: ["0%", "100%", "0%"] }}
+                              transition={{ duration: 2.5, repeat: Infinity, ease: "linear" }}
+                              className="absolute left-0 w-full h-0.5 bg-gradient-to-r from-transparent via-indigo-400 to-transparent shadow-[0_0_12px_#818cf8]"
+                            />
                           </div>
-                          <p className="text-white/50 text-sm">Camera starts after model load</p>
-                        </>
-                      )}
-                    </div>
-                  )}
+                        </div>
+                        {activeInstruction && (
+                          <div className="absolute bottom-14 left-4 right-4 flex justify-center">
+                            <motion.div
+                              key={activeInstruction}
+                              initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
+                              className="px-4 py-2 rounded-full bg-indigo-600/80 backdrop-blur-sm text-white text-sm font-medium shadow-lg"
+                            >
+                              {activeInstruction}
+                            </motion.div>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
-                  {/* Monitoring overlay */}
-                  {pageState === "monitoring" && (
-                    <div className="absolute inset-0 z-20 pointer-events-none">
-                      {/* Face frame */}
-                      <div className="absolute inset-0 flex items-center justify-center">
-                        <div className="w-44 h-60 border-2 border-indigo-400/40 rounded-[40px] relative">
-                          <div className="absolute -top-1 -left-1  w-5 h-5 border-t-2 border-l-2 border-indigo-400" />
-                          <div className="absolute -top-1 -right-1 w-5 h-5 border-t-2 border-r-2 border-indigo-400" />
-                          <div className="absolute -bottom-1 -left-1  w-5 h-5 border-b-2 border-l-2 border-indigo-400" />
-                          <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-2 border-r-2 border-indigo-400" />
+                    {/* Verifying overlay */}
+                    {pageState === "verifying" && (
+                      <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm">
+                        <Loader2 className="w-12 h-12 text-indigo-400 animate-spin mb-3" />
+                        <p className="text-white font-semibold">Verifying identity…</p>
+                        <p className="text-indigo-300 text-sm mt-1">Matching face against database</p>
+                      </div>
+                    )}
+
+                    {/* Failed overlay */}
+                    {pageState === "failed" && (
+                      <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80">
+                        <ShieldX className="w-12 h-12 text-red-400 mb-3" />
+                        <p className="text-white font-semibold text-center px-8">{errorMsg || "Authentication Failed"}</p>
+                      </div>
+                    )}
+
+                    {/* Top-bar: LIVE badge + countdown */}
+                    {["camera-ready", "monitoring"].includes(pageState) && (
+                      <div className="absolute top-4 left-4 right-4 z-30 flex items-center justify-between">
+                        <div className="flex items-center gap-2 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-full border border-white/10">
+                          <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                          <span className="text-xs font-mono text-white/80 uppercase">Live</span>
+                        </div>
+                        {pageState === "monitoring" && (
+                          <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-mono font-bold ${
+                            timeLeft <= 7
+                              ? "bg-red-900/60 border-red-500/50 text-red-300"
+                              : "bg-black/60 border-white/10 text-indigo-300"
+                          }`}>
+                            <Timer className="w-3.5 h-3.5" />
+                            {timeLeft}s
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Bottom progress bar */}
+                    {pageState === "monitoring" && (
+                      <div className="absolute bottom-0 left-0 right-0 z-30">
+                        <div className="h-1.5 bg-white/10">
                           <motion.div
-                            animate={{ top: ["0%","100%","0%"] }}
-                            transition={{ duration: 2.5, repeat: Infinity, ease: "linear" }}
-                            className="absolute left-0 w-full h-0.5 bg-gradient-to-r from-transparent via-indigo-400 to-transparent shadow-[0_0_12px_#818cf8]"
+                            animate={{ width: `${(passedCount / 4) * 100}%` }}
+                            transition={{ duration: 0.4 }}
+                            className="h-full bg-gradient-to-r from-indigo-500 to-purple-500"
                           />
                         </div>
                       </div>
-                      {/* Instruction banner at bottom */}
-                      {activeInstruction && (
-                        <div className="absolute bottom-14 left-4 right-4 flex justify-center">
+                    )}
+                  </div>
+                </div>
+
+                {/* Email input (shown before monitoring starts) */}
+                {["idle", "camera-ready", "loading-models"].includes(pageState) && (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-300 ml-1">Email Address</label>
+                    <div className="relative">
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                        <User className="h-5 w-5 text-gray-500" />
+                      </div>
+                      <input
+                        type="email" value={email}
+                        onChange={e => setEmail(e.target.value)}
+                        onKeyDown={e => e.key === "Enter" && pageState === "camera-ready" && startMonitoring()}
+                        className="w-full pl-11 pr-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
+                        placeholder="you@example.com"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {/* Primary action buttons */}
+                {pageState === "idle" && (
+                  <button
+                    onClick={loadModels} disabled={!email.trim()}
+                    className="w-full py-4 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-500 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5 transition-all duration-200 flex items-center justify-center gap-2"
+                  >
+                    <ShieldCheck className="w-5 h-5" /> Begin Authentication
+                  </button>
+                )}
+
+                {pageState === "camera-ready" && (
+                  <button
+                    onClick={startMonitoring} disabled={!email.trim()}
+                    className="w-full py-4 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-500 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5 transition-all duration-200 flex items-center justify-center gap-2"
+                  >
+                    <Zap className="w-5 h-5" /> Start Liveness Check
+                  </button>
+                )}
+
+                {pageState === "failed" && (
+                  <button
+                    onClick={resetLiveness}
+                    className="w-full py-4 rounded-xl font-bold text-white bg-gradient-to-r from-rose-600 to-red-700 hover:shadow-[0_0_30px_rgba(239,68,68,0.4)] hover:-translate-y-0.5 transition-all duration-200 flex items-center justify-center gap-2"
+                  >
+                    <RefreshCw className="w-5 h-5" /> Try Again
+                  </button>
+                )}
+
+                {/* Developer debug panel */}
+                {pageState === "monitoring" && (debugEAR !== null || debugLip !== null) && (
+                  <motion.div
+                    initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                    className="glass-panel rounded-2xl p-4 border-white/5 bg-black/40"
+                  >
+                    <div className="flex items-center gap-2 mb-3">
+                      <Activity className="w-4 h-4 text-indigo-400" />
+                      <span className="text-xs font-mono text-gray-400 uppercase tracking-wider">Live Debug</span>
+                    </div>
+                    <div className="space-y-2 font-mono text-xs">
+                      {debugEAR !== null && (
+                        <div className="flex justify-between text-gray-400">
+                          <span>Eye Aspect Ratio (EAR)</span>
+                          <span className="text-green-400">{debugEAR.toFixed(3)}</span>
+                        </div>
+                      )}
+                      {debugLip !== null && (
+                        <div className="flex justify-between text-gray-400">
+                          <span>Lip Gap</span>
+                          <span className={debugLip > 6 ? "text-yellow-400" : "text-gray-500"}>{debugLip}px</span>
+                        </div>
+                      )}
+                      {antiSpoofScore !== null && (
+                        <div className="flex justify-between text-gray-400">
+                          <span>Anti-Spoof Score</span>
+                          <span className={antiSpoofScore >= 65 ? "text-green-400" : antiSpoofScore >= 40 ? "text-yellow-400" : "text-red-400"}>
+                            {antiSpoofScore}/100
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </motion.div>
+
+              {/* ── RIGHT: Checks + Anti-Spoof Shield + Instructions ──────── */}
+              <motion.div initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.2 }} className="flex flex-col gap-5">
+
+                {/* ── Stage 2 Anti-Spoof Shield Panel ───────────────────── */}
+                <div className={`glass-panel rounded-3xl p-6 border transition-colors duration-500 ${shieldColor}`}>
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center gap-3">
+                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${
+                        antiSpoofScore === null      ? "bg-white/5" :
+                        antiSpoofScore >= 65         ? "bg-green-500/20" :
+                        antiSpoofScore >= 40         ? "bg-yellow-500/20" :
+                                                       "bg-red-500/20"
+                      }`}>
+                        <Shield className={`w-5 h-5 ${
+                          antiSpoofScore === null      ? "text-gray-400" :
+                          antiSpoofScore >= 65         ? "text-green-400" :
+                          antiSpoofScore >= 40         ? "text-yellow-400" :
+                                                         "text-red-400"
+                        }`} />
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-bold text-white">Anti-Spoof Shield</h3>
+                        <p className="text-xs text-gray-400">
+                          {pageState !== "monitoring"
+                            ? "Active during liveness check"
+                            : antiSpoofScore === null
+                              ? "Initializing…"
+                              : antiSpoofScore >= 65
+                                ? "No spoofing detected"
+                                : antiSpoofScore >= 40
+                                  ? "Analyzing — hold steady"
+                                  : "Suspicious signal — use real face"
+                          }
+                        </p>
+                      </div>
+                    </div>
+                    {antiSpoofScore !== null && (
+                      <span className={`text-lg font-bold font-mono ${
+                        antiSpoofScore >= 65 ? "text-green-400" :
+                        antiSpoofScore >= 40 ? "text-yellow-400" : "text-red-400"
+                      }`}>
+                        {antiSpoofScore}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Score bar */}
+                  <div className="h-1.5 rounded-full bg-white/10 overflow-hidden mb-4">
+                    <motion.div
+                      animate={{ width: `${antiSpoofScore ?? 0}%` }}
+                      transition={{ duration: 0.4 }}
+                      className={`h-full rounded-full ${
+                        (antiSpoofScore ?? 0) >= 65 ? "bg-gradient-to-r from-green-500 to-emerald-400" :
+                        (antiSpoofScore ?? 0) >= 40 ? "bg-gradient-to-r from-yellow-500 to-orange-400" :
+                                                       "bg-gradient-to-r from-red-600 to-rose-500"
+                      }`}
+                    />
+                  </div>
+
+                  {/* Signal breakdown (shown when we have data) */}
+                  {antiSpoofSignals && (
+                    <div className="grid grid-cols-2 gap-2">
+                      {[
+                        { label: "Glare",     value: antiSpoofSignals.glare,            icon: "✦" },
+                        { label: "Texture",   value: antiSpoofSignals.texture,          icon: "◈" },
+                        { label: "Colour",    value: antiSpoofSignals.colorNaturalness, icon: "◉" },
+                        { label: "Motion",    value: antiSpoofSignals.temporalVariance, icon: "⊛" },
+                      ].map(({ label, value, icon }) => (
+                        <div key={label} className="flex items-center gap-2 bg-black/20 rounded-lg px-3 py-2">
+                          <span className="text-xs text-gray-500">{icon}</span>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex justify-between items-center">
+                              <span className="text-xs text-gray-400">{label}</span>
+                              <span className={`text-xs font-mono font-semibold ${
+                                value >= 65 ? "text-green-400" :
+                                value >= 40 ? "text-yellow-400" : "text-red-400"
+                              }`}>{value}</span>
+                            </div>
+                            <div className="h-1 rounded-full bg-white/10 mt-1 overflow-hidden">
+                              <div
+                                className={`h-full rounded-full transition-all duration-300 ${
+                                  value >= 65 ? "bg-green-500" :
+                                  value >= 40 ? "bg-yellow-500" : "bg-red-500"
+                                }`}
+                                style={{ width: `${value}%` }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* ── Stage 3 Liveness Detection Panel ──────────────────── */}
+                <div className="glass-panel rounded-3xl p-6 md:p-8 border-white/10">
+                  <div className="flex items-center justify-between mb-6">
+                    <h2 className="text-xl font-bold text-white">Liveness Detection</h2>
+                    <span className="text-sm text-indigo-400 font-medium">{passedCount} / 4 passed</span>
+                  </div>
+
+                  <div className="space-y-3">
+                    {checks.map(({ key, label, icon: Icon, hint }) => {
+                      const passed   = liveness[key];
+                      const isActive = pageState === "monitoring" && !passed
+                        && INSTRUCTIONS.findIndex(i => !liveness[i.key]) === checks.findIndex(c => c.key === key);
+                      return (
+                        <motion.div
+                          key={key}
+                          animate={passed ? { scale: [1, 1.02, 1] } : {}}
+                          transition={{ duration: 0.3 }}
+                          className={`flex items-center gap-4 p-4 rounded-2xl border transition-all duration-300 ${
+                            passed    ? "bg-green-500/10 border-green-500/30"
+                            : isActive ? "bg-indigo-500/10 border-indigo-500/30"
+                                       : "bg-white/3 border-white/8"
+                          }`}
+                        >
+                          <div className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors ${
+                            passed ? "bg-green-500/20" : isActive ? "bg-indigo-500/15" : "bg-white/5"
+                          }`}>
+                            <Icon className={`w-5 h-5 ${passed ? "text-green-400" : isActive ? "text-indigo-300" : "text-gray-400"}`} />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className={`font-semibold text-sm ${passed ? "text-green-300" : isActive ? "text-indigo-200" : "text-white"}`}>
+                              {label}
+                            </p>
+                            <p className={`text-xs mt-0.5 ${passed ? "text-green-500/70" : isActive ? "text-indigo-400" : "text-gray-500"}`}>
+                              {passed ? "Verified ✓" : isActive ? hint : "Pending"}
+                            </p>
+                          </div>
+                          <AnimatePresence mode="wait">
+                            {passed ? (
+                              <motion.div key="check" initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: "spring", bounce: 0.6 }}>
+                                <CheckCircle2 className="w-6 h-6 text-green-400 flex-shrink-0" />
+                              </motion.div>
+                            ) : (
+                              <motion.div key="ring" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex-shrink-0">
+                                <div className={`w-6 h-6 rounded-full border-2 ${isActive ? "border-indigo-400 animate-pulse" : "border-white/20"}`} />
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Overall progress */}
+                  <div className="mt-6">
+                    <div className="flex justify-between text-xs text-gray-400 mb-2">
+                      <span>Overall Progress</span>
+                      <span>{Math.round((passedCount / 4) * 100)}%</span>
+                    </div>
+                    <div className="h-2 rounded-full bg-white/5 overflow-hidden">
+                      <motion.div
+                        animate={{ width: `${(passedCount / 4) * 100}%` }}
+                        transition={{ duration: 0.5, ease: "easeOut" }}
+                        className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-purple-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Instructions ──────────────────────────────────────── */}
+                <div className="glass-panel rounded-3xl p-6 border-white/10">
+                  <h3 className="text-base font-bold text-white mb-4 flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-yellow-400" />
+                    How to Complete Authentication
+                  </h3>
+                  <ul className="space-y-3">
+                    {[
+                      "Position your real face inside the scan frame",
+                      "Blink your eyes naturally (close fully, then open)",
+                      "Open your mouth, then close it slowly",
+                      "Gently tilt or turn your head left or right",
+                      "Good lighting helps — avoid backlight or shadows",
+                      "Do not use a photo, screen or video of a face",
+                    ].map((tip, i) => (
+                      <li key={i} className="flex items-start gap-3 text-sm text-gray-400">
+                        <span className="flex-shrink-0 w-5 h-5 rounded-full bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-xs text-indigo-400 font-bold">
+                          {i + 1}
+                        </span>
+                        {tip}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                {/* ── Confidence on success ──────────────────────────────── */}
+                {pageState === "success" && confidence !== null && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
+                    className="glass-panel rounded-3xl p-6 border-green-500/20 bg-green-500/5"
+                  >
+                    <h3 className="text-base font-bold text-green-300 mb-3">Authentication Score</h3>
+                    <div className="flex items-center gap-4">
+                      <div className="text-5xl font-bold text-white">
+                        {confidence}<span className="text-xl text-green-400">%</span>
+                      </div>
+                      <div className="flex-1">
+                        <div className="h-3 rounded-full bg-white/5 overflow-hidden">
                           <motion.div
-                            key={activeInstruction}
-                            initial={{ opacity: 0, y: 6 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="px-4 py-2 rounded-full bg-indigo-600/80 backdrop-blur-sm text-white text-sm font-medium shadow-lg"
-                          >
-                            {activeInstruction}
-                          </motion.div>
+                            initial={{ width: 0 }} animate={{ width: `${confidence}%` }}
+                            transition={{ duration: 1, ease: "easeOut", delay: 0.3 }}
+                            className="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400"
+                          />
                         </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Verifying */}
-                  {pageState === "verifying" && (
-                    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm">
-                      <Loader2 className="w-12 h-12 text-indigo-400 animate-spin mb-3" />
-                      <p className="text-white font-semibold">Verifying identity…</p>
-                      <p className="text-indigo-300 text-sm mt-1">Matching face against database</p>
-                    </div>
-                  )}
-
-                  {/* Success */}
-                  {pageState === "success" && (
-                    <motion.div
-                      initial={{ opacity: 0 }} animate={{ opacity: 1 }}
-                      className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/70 backdrop-blur-sm"
-                    >
-                      <motion.div
-                        initial={{ scale: 0 }} animate={{ scale: 1 }}
-                        transition={{ type: "spring", bounce: 0.5 }}
-                        className="w-20 h-20 rounded-full bg-green-500/20 border border-green-500/50 flex items-center justify-center mb-4 shadow-[0_0_30px_rgba(34,197,94,0.4)]"
-                      >
-                        <ShieldCheck className="w-10 h-10 text-green-400" />
-                      </motion.div>
-                      <h3 className="text-2xl font-bold text-white">Access Granted</h3>
-                      {confidence !== null && (
-                        <p className="text-green-400 text-sm mt-1">Match confidence: {confidence}%</p>
-                      )}
-                    </motion.div>
-                  )}
-
-                  {/* Failed */}
-                  {pageState === "failed" && (
-                    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80">
-                      <ShieldX className="w-12 h-12 text-red-400 mb-3" />
-                      <p className="text-white font-semibold text-center px-8">{errorMsg || "Authentication Failed"}</p>
-                    </div>
-                  )}
-
-                  {/* Top bar: LIVE + timer */}
-                  {["camera-ready","monitoring"].includes(pageState) && (
-                    <div className="absolute top-4 left-4 right-4 z-30 flex items-center justify-between">
-                      <div className="flex items-center gap-2 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-full border border-white/10">
-                        <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                        <span className="text-xs font-mono text-white/80 uppercase">Live</span>
-                      </div>
-                      {pageState === "monitoring" && (
-                        <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-mono font-bold ${
-                          timeLeft <= 7
-                            ? "bg-red-900/60 border-red-500/50 text-red-300"
-                            : "bg-black/60 border-white/10 text-indigo-300"
-                        }`}>
-                          <Timer className="w-3.5 h-3.5" />
-                          {timeLeft}s
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Progress bar */}
-                  {pageState === "monitoring" && (
-                    <div className="absolute bottom-0 left-0 right-0 z-30">
-                      <div className="h-1.5 bg-white/10">
-                        <motion.div
-                          animate={{ width: `${(passedCount / 4) * 100}%` }}
-                          transition={{ duration: 0.4 }}
-                          className="h-full bg-gradient-to-r from-indigo-500 to-purple-500"
-                        />
+                        <p className="text-xs text-green-400/70 mt-1.5">Face descriptor match confidence</p>
                       </div>
                     </div>
-                  )}
-                </div>
-              </div>
+                  </motion.div>
+                )}
 
-              {/* Email input */}
-              {["idle","camera-ready","loading-models"].includes(pageState) && (
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-300 ml-1">Email Address</label>
-                  <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                      <User className="h-5 w-5 text-gray-500" />
-                    </div>
-                    <input
-                      type="email"
-                      value={email}
-                      onChange={e => setEmail(e.target.value)}
-                      onKeyDown={e => e.key === "Enter" && pageState === "camera-ready" && startMonitoring()}
-                      className="w-full pl-11 pr-4 py-3.5 bg-black/40 border border-white/10 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all"
-                      placeholder="you@example.com"
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* Action buttons */}
-              {pageState === "idle" && (
-                <button
-                  onClick={loadModels}
-                  disabled={!email.trim()}
-                  className="w-full py-4 px-6 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] disabled:opacity-40 disabled:cursor-not-allowed hover:-translate-y-0.5 active:translate-y-0 transition-all flex items-center justify-center gap-2"
-                >
-                  <Eye className="w-5 h-5" />
-                  Start Camera & Load AI
-                </button>
-              )}
-
-              {pageState === "camera-ready" && (
-                <button
-                  onClick={startMonitoring}
-                  className="w-full py-4 px-6 rounded-xl font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 shadow-[0_0_20px_rgba(99,102,241,0.3)] hover:shadow-[0_0_30px_rgba(99,102,241,0.5)] hover:-translate-y-0.5 active:translate-y-0 transition-all flex items-center justify-center gap-2 group"
-                >
-                  <Zap className="w-5 h-5" />
-                  Begin Liveness Verification
-                  <ChevronRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
-                </button>
-              )}
-
-              {pageState === "monitoring" && (
-                <div className="py-3 text-center text-indigo-300 text-sm font-medium bg-indigo-500/10 rounded-xl border border-indigo-500/20">
-                  Follow the on-screen prompts →
-                </div>
-              )}
-
-              {pageState === "failed" && (
-                <button
-                  onClick={resetLiveness}
-                  className="w-full py-4 px-6 rounded-xl font-bold text-white bg-white/10 hover:bg-white/15 border border-white/15 hover:-translate-y-0.5 transition-all flex items-center justify-center gap-2"
-                >
-                  <RefreshCw className="w-5 h-5" />
-                  Try Again
-                </button>
-              )}
-
-              {pageState === "success" && successMsg && (
-                <div className="py-4 rounded-xl bg-green-500/10 border border-green-500/30 text-green-300 text-center font-semibold">
-                  {successMsg}
-                </div>
-              )}
-
-              {/* Debug panel (only during monitoring) */}
-              {pageState === "monitoring" && (debugEAR !== null || debugLip !== null) && (
-                <div className="p-4 rounded-xl bg-black/40 border border-white/5 text-xs font-mono space-y-1">
-                  <div className="flex items-center gap-2 text-indigo-300 mb-2">
-                    <Activity className="w-3.5 h-3.5" />
-                    <span className="font-semibold uppercase tracking-wider">Live Sensor Readout</span>
-                  </div>
-                  {debugEAR !== null && (
-                    <div className="flex justify-between text-gray-400">
-                      <span>Eye Aspect Ratio (EAR)</span>
-                      <span className={
-                        earHistory.current.length >= 4 &&
-                        Math.max(...earHistory.current) > 0.15 &&
-                        debugEAR <= Math.max(...earHistory.current) * BLINK_DROP_RATIO
-                          ? "text-yellow-400 font-bold"
-                          : "text-green-400"
-                      }>
-                        {debugEAR.toFixed(3)}
-                        {earHistory.current.length >= 2 &&
-                          ` (max ${Math.max(...earHistory.current).toFixed(3)})`}
-                      </span>
-                    </div>
-                  )}
-                  {debugLip !== null && (
-                    <div className="flex justify-between text-gray-400">
-                      <span>Lip Gap (px)</span>
-                      <span className={debugLip > LIP_OPEN_PX ? "text-yellow-400" : "text-gray-500"}>
-                        {debugLip}px
-                        {debugLip > LIP_OPEN_PX && " ← open"}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
-            </motion.div>
-
-            {/* ── RIGHT: Checks + Instructions ─────────────────────────────── */}
-            <motion.div initial={{ opacity: 0, x: 30 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.2 }} className="flex flex-col gap-5">
-
-              {/* Liveness check cards */}
-              <div className="glass-panel rounded-3xl p-6 md:p-8 border-white/10">
-                <div className="flex items-center justify-between mb-6">
-                  <h2 className="text-xl font-bold text-white">Liveness Detection</h2>
-                  <span className="text-sm text-indigo-400 font-medium">{passedCount} / 4 passed</span>
-                </div>
-
-                <div className="space-y-3">
-                  {checks.map(({ key, label, icon: Icon, hint }) => {
-                    const passed = liveness[key];
-                    const isActive = pageState === "monitoring" && !passed
-                      && INSTRUCTIONS.findIndex(i => !liveness[i.key as keyof LivenessState]) === checks.indexOf({ key, label, icon: Icon, hint });
-                    return (
-                      <motion.div
-                        key={key}
-                        animate={passed ? { scale: [1, 1.02, 1] } : {}}
-                        transition={{ duration: 0.3 }}
-                        className={`flex items-center gap-4 p-4 rounded-2xl border transition-all duration-300 ${
-                          passed
-                            ? "bg-green-500/10 border-green-500/30"
-                            : isActive
-                            ? "bg-indigo-500/10 border-indigo-500/30"
-                            : "bg-white/3 border-white/8"
-                        }`}
-                      >
-                        <div className={`w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors ${
-                          passed ? "bg-green-500/20" : isActive ? "bg-indigo-500/15" : "bg-white/5"
-                        }`}>
-                          <Icon className={`w-5 h-5 ${passed ? "text-green-400" : isActive ? "text-indigo-300" : "text-gray-400"}`} />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className={`font-semibold text-sm ${passed ? "text-green-300" : isActive ? "text-indigo-200" : "text-white"}`}>
-                            {label}
+                {/* ── Failure panel ──────────────────────────────────────── */}
+                {pageState === "failed" && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
+                    className={`glass-panel rounded-3xl p-6 border ${
+                      spoofDetected
+                        ? "border-orange-500/30 bg-orange-500/5"
+                        : "border-red-500/20 bg-red-500/5"
+                    }`}
+                  >
+                    <div className="flex items-start gap-3">
+                      {spoofDetected ? (
+                        <Shield className="w-6 h-6 text-orange-400 flex-shrink-0 mt-0.5" />
+                      ) : (
+                        <XCircle className="w-6 h-6 text-red-400 flex-shrink-0 mt-0.5" />
+                      )}
+                      <div>
+                        <h3 className={`text-base font-bold mb-1 ${spoofDetected ? "text-orange-300" : "text-red-300"}`}>
+                          {spoofDetected ? "Spoofing Attempt Detected" : "Authentication Failed"}
+                        </h3>
+                        <p className="text-sm text-gray-400">
+                          {errorMsg || "Liveness check failed. Please try again."}
+                        </p>
+                        {spoofDetected && (
+                          <p className="text-xs text-orange-400/80 mt-2">
+                            The anti-spoof shield detected a non-real face. Please look directly into the camera with your real face.
                           </p>
-                          <p className={`text-xs mt-0.5 ${passed ? "text-green-500/70" : isActive ? "text-indigo-400" : "text-gray-500"}`}>
-                            {passed ? "Verified ✓" : isActive ? hint : "Pending"}
-                          </p>
-                        </div>
-                        <AnimatePresence mode="wait">
-                          {passed ? (
-                            <motion.div key="check" initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: "spring", bounce: 0.6 }}>
-                              <CheckCircle2 className="w-6 h-6 text-green-400 flex-shrink-0" />
-                            </motion.div>
-                          ) : (
-                            <motion.div key="ring" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex-shrink-0">
-                              <div className={`w-6 h-6 rounded-full border-2 ${isActive ? "border-indigo-400 animate-pulse" : "border-white/20"}`} />
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
-                      </motion.div>
-                    );
-                  })}
-                </div>
-
-                {/* Overall progress */}
-                <div className="mt-6">
-                  <div className="flex justify-between text-xs text-gray-400 mb-2">
-                    <span>Overall Progress</span>
-                    <span>{Math.round((passedCount / 4) * 100)}%</span>
-                  </div>
-                  <div className="h-2 rounded-full bg-white/5 overflow-hidden">
-                    <motion.div
-                      animate={{ width: `${(passedCount / 4) * 100}%` }}
-                      transition={{ duration: 0.5, ease: "easeOut" }}
-                      className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-purple-500"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Instructions */}
-              <div className="glass-panel rounded-3xl p-6 border-white/10">
-                <h3 className="text-base font-bold text-white mb-4 flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-yellow-400" />
-                  How to Complete Liveness Check
-                </h3>
-                <ul className="space-y-3">
-                  {[
-                    "Position your face inside the scan frame",
-                    "Blink your eyes naturally (close fully, then open)",
-                    "Open your mouth, then close it",
-                    "Gently tilt or turn your head left or right",
-                    "Stay in frame — skin texture is verified automatically",
-                    "Good lighting helps — avoid backlighting",
-                  ].map((tip, i) => (
-                    <li key={i} className="flex items-start gap-3 text-sm text-gray-400">
-                      <span className="flex-shrink-0 w-5 h-5 rounded-full bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-xs text-indigo-400 font-bold">
-                        {i + 1}
-                      </span>
-                      {tip}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-
-              {/* Confidence on success */}
-              {pageState === "success" && confidence !== null && (
-                <motion.div
-                  initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}
-                  className="glass-panel rounded-3xl p-6 border-green-500/20 bg-green-500/5"
-                >
-                  <h3 className="text-base font-bold text-green-300 mb-3">Authentication Score</h3>
-                  <div className="flex items-center gap-4">
-                    <div className="text-5xl font-bold text-white">
-                      {confidence}<span className="text-xl text-green-400">%</span>
-                    </div>
-                    <div className="flex-1">
-                      <div className="h-3 rounded-full bg-white/5 overflow-hidden">
-                        <motion.div
-                          initial={{ width: 0 }}
-                          animate={{ width: `${confidence}%` }}
-                          transition={{ duration: 1, ease: "easeOut", delay: 0.3 }}
-                          className="h-full rounded-full bg-gradient-to-r from-green-500 to-emerald-400"
-                        />
+                        )}
                       </div>
-                      <p className="text-xs text-green-400/70 mt-1.5">Face descriptor match confidence</p>
                     </div>
-                  </div>
-                </motion.div>
-              )}
-
-              {/* Failure panel */}
-              {pageState === "failed" && (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
-                  className="glass-panel rounded-3xl p-6 border-red-500/20 bg-red-500/5"
-                >
-                  <div className="flex items-start gap-3">
-                    <XCircle className="w-6 h-6 text-red-400 flex-shrink-0 mt-0.5" />
-                    <div>
-                      <h3 className="text-base font-bold text-red-300 mb-1">Authentication Failed</h3>
-                      <p className="text-sm text-gray-400">
-                        {errorMsg || "Liveness check failed. Possible spoof detected."}
-                      </p>
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-            </motion.div>
-          </div>}
+                  </motion.div>
+                )}
+              </motion.div>
+            </div>
+          )}
         </div>
       </main>
     </div>
