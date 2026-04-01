@@ -8,12 +8,13 @@
  *    every DETECTION_INTERVAL_MS milliseconds.
  *
  *  Stage 2 · Anti-Spoofing (runs concurrently with Stage 3)
- *    AntiSpoofEngine analyses the face crop for:
+ *    AntiSpoofEngine analyses the face crop for five signals:
  *      · Glare / specular reflection (screen hotspots)
  *      · LBP micro-texture entropy (real skin vs. printed / screen texture)
  *      · Colour naturalness (skin-tone distribution)
  *      · Temporal micro-variance (organic face motion vs. static image)
- *    Three consecutive "spoof" readings → session rejected immediately.
+ *      · Motion consistency (CoV of MAD — detects rigid phone-tremor)
+ *    Two consecutive "spoof" readings → session rejected immediately.
  *
  *  Stage 3 · Liveness Detection (runs concurrently with Stage 2)
  *    LivenessDetector requires the user to complete four behavioural proofs:
@@ -56,7 +57,7 @@ const DETECTION_INTERVAL_MS = 200;   // Face detection tick rate
 const LIVENESS_TIMEOUT_S   = 30;     // Total time allowed for liveness
 const ANTI_SPOOF_INTERVAL  = 2;      // Run anti-spoof every N-th detection tick
 const ANTI_SPOOF_WARMUP    = 4;      // Skip anti-spoof for first N ticks (warm-up)
-const SPOOF_REJECT_COUNT   = 3;      // Consecutive "spoof" readings before rejection
+const SPOOF_REJECT_COUNT   = 2;      // Consecutive "spoof" readings before rejection
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -1050,10 +1051,11 @@ export default function Login() {
                   {antiSpoofSignals && (
                     <div className="grid grid-cols-2 gap-2">
                       {[
-                        { label: "Glare",     value: antiSpoofSignals.glare,            icon: "✦" },
-                        { label: "Texture",   value: antiSpoofSignals.texture,          icon: "◈" },
-                        { label: "Colour",    value: antiSpoofSignals.colorNaturalness, icon: "◉" },
-                        { label: "Motion",    value: antiSpoofSignals.temporalVariance, icon: "⊛" },
+                        { label: "Glare",       value: antiSpoofSignals.glare,             icon: "✦" },
+                        { label: "Texture",     value: antiSpoofSignals.texture,           icon: "◈" },
+                        { label: "Colour",      value: antiSpoofSignals.colorNaturalness,  icon: "◉" },
+                        { label: "Motion",      value: antiSpoofSignals.temporalVariance,  icon: "⊛" },
+                        { label: "Regularity",  value: antiSpoofSignals.motionConsistency, icon: "≋" },
                       ].map(({ label, value, icon }) => (
                         <div key={label} className="flex items-center gap-2 bg-black/20 rounded-lg px-3 py-2">
                           <span className="text-xs text-gray-500">{icon}</span>

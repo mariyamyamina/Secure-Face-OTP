@@ -1,29 +1,44 @@
 /**
- * Anti-Spoofing Engine
+ * Anti-Spoofing Engine  (v3 — tightened against phone-screen attacks)
  *
- * Classifies a webcam frame as "real face" or "spoof (photo / screen / video)"
- * using four independent, client-side signals that are cheap to compute:
+ * WHY THE PREVIOUS VERSION FAILED
+ * ─────────────────────────────────
+ * A high-quality modern phone screen (460+ PPI) at 30–40 cm distance looks
+ * almost identical to a real face when captured by a typical webcam:
  *
- *  1. Glare / Specular Detection  – phone screens reflect ambient light and
- *     camera fill-light, producing a high ratio of near-white pixels in the
- *     captured face region. Real skin almost never has that many bright spots.
+ *  • Glare       – anti-reflective coatings and soft indoor light keep hot
+ *                  pixels well below the old 4 % trigger threshold.
+ *  • LBP texture – the photo is rendered at sub-pixel precision; from the
+ *                  camera's view there are no visible screen pixels → entropy
+ *                  is indistinguishable from real skin.
+ *  • Color       – a face photo trivially passes the skin-tone check.
+ *  • Temporal    – hand tremor causes the entire phone image to shift
+ *                  rigidly ~2-5 px per frame, which the old check scored as
+ *                  "natural face motion" (score = 100).
  *
- *  2. LBP Micro-Texture Entropy  – Local Binary Patterns (LBP) characterise
- *     the fine-grain texture of the image. Real skin has rich, organic texture
- *     (high entropy). Screen-rendered images and printed photos are smoother
- *     (lower entropy) because they lack natural pore/hair micro-detail.
+ * CHANGES IN THIS VERSION
+ * ────────────────────────
+ *  1. Glare threshold tightened:  "safe" reduced from 4 % → 1.5 % bright
+ *     pixels.  Even a well-coated screen usually reflects ≥ 2 % in typical
+ *     office/home lighting.
  *
- *  3. Colour Naturalness  – A face crop should contain a high proportion of
- *     pixels in the expected skin-tone range. A phone bezel, screen edge, or
- *     printed background shifts that proportion outside typical bounds.
+ *  2. LBP threshold tightened:  "definitely real" raised from 0.72 → 0.80
+ *     normalised entropy.  This shaves off borderline screen captures.
  *
- *  4. Temporal Micro-Variance  – Real faces exhibit constant subtle movement
- *     (breathing, micro-expressions, eye saccades). A static photo has near-
- *     zero frame-to-frame difference; a screen playing a video shows a
- *     distinctly compressed-video-noise pattern that differs from organic motion.
+ *  3. NEW signal — Motion Consistency (Coefficient of Variation of MAD):
+ *     Hand tremor produces VERY CONSISTENT frame-to-frame MAD (regular
+ *     oscillation at 8-12 Hz sampled at ~5 Hz → near-constant MAD).
+ *     Organic face micro-motion is IRREGULAR — pauses, micro-expressions,
+ *     breathing cadence all vary.  CoV (std/mean) of the MAD history:
+ *       • Low CoV (< 0.20) → suspiciously regular → spoof indicator
+ *       • High CoV (> 0.55) → irregular motion  → real face indicator
  *
- * Signals are combined with calibrated weights into a single 0-100 score.
- * Any single catastrophically low signal (< 15) immediately flags a spoof.
+ *  4. Combined score threshold raised:  42 → 58.  Previously a phone could
+ *     coast on three 80-point signals; now it needs genuine performance
+ *     across all four.
+ *
+ *  5. Catastrophic override now also fires when temporal variance < 10
+ *     (near-zero motion = strong static-image indicator).
  */
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -37,6 +52,8 @@ export interface SpoofSignals {
   colorNaturalness: number;
   /** 0-100: higher = natural face micro-motion present → more likely real */
   temporalVariance: number;
+  /** 0-100: higher = irregular (organic) motion → more likely real */
+  motionConsistency: number;
 }
 
 export interface AntiSpoofResult {
@@ -61,67 +78,47 @@ export interface FaceBounds {
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
-/**
- * Stateful engine — instantiate once per authentication session.
- * Call `reset()` when the user restarts liveness monitoring.
- * Call `analyze()` every N detection ticks (e.g., every 2nd tick).
- */
 export class AntiSpoofEngine {
-  // Temporal variance state
-  private prevGray: Uint8ClampedArray | null = null;
-  private motionHistory: number[] = [];
+  // Temporal state
+  private prevGray:      Uint8ClampedArray | null = null;
+  private motionHistory: number[]                 = [];
 
-  // Off-screen canvas for pixel extraction
+  // Off-screen canvas
   private readonly canvas: HTMLCanvasElement;
-  private readonly ctx: CanvasRenderingContext2D;
-  private readonly SIZE = 64; // analyse at 64×64 — fast and sufficient
+  private readonly ctx:    CanvasRenderingContext2D;
+  private readonly SIZE = 64;
 
   constructor() {
-    this.canvas = document.createElement("canvas");
-    this.canvas.width = this.SIZE;
+    this.canvas        = document.createElement("canvas");
+    this.canvas.width  = this.SIZE;
     this.canvas.height = this.SIZE;
     const ctx = this.canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) throw new Error("AntiSpoofEngine: Canvas 2D context unavailable");
     this.ctx = ctx;
   }
 
-  /** Reset temporal state — call when monitoring restarts */
   reset(): void {
-    this.prevGray = null;
+    this.prevGray      = null;
     this.motionHistory = [];
   }
 
-  /**
-   * Analyse a single frame.
-   *
-   * @param video       Live HTMLVideoElement from the webcam.
-   * @param faceBounds  Optional bounding box of the detected face region.
-   *                    When provided the engine crops to the face, which
-   *                    improves accuracy of all four signals significantly.
-   */
   analyze(video: HTMLVideoElement, faceBounds?: FaceBounds): AntiSpoofResult {
-    // ── Crop to face region (or full frame) ──────────────────────────────────
-    if (
-      faceBounds &&
-      faceBounds.width > 10 &&
-      faceBounds.height > 10
-    ) {
-      // Add a small margin around the detected face box
+    // ── Crop to face region ───────────────────────────────────────────────────
+    if (faceBounds && faceBounds.width > 10 && faceBounds.height > 10) {
       const pad = Math.round(faceBounds.width * 0.1);
-      const sx = Math.max(0, faceBounds.x - pad);
-      const sy = Math.max(0, faceBounds.y - pad);
-      const sw = Math.min(video.videoWidth - sx, faceBounds.width + pad * 2);
-      const sh = Math.min(video.videoHeight - sy, faceBounds.height + pad * 2);
+      const sx  = Math.max(0, faceBounds.x - pad);
+      const sy  = Math.max(0, faceBounds.y - pad);
+      const sw  = Math.min(video.videoWidth  - sx, faceBounds.width  + pad * 2);
+      const sh  = Math.min(video.videoHeight - sy, faceBounds.height + pad * 2);
       this.ctx.drawImage(video, sx, sy, sw, sh, 0, 0, this.SIZE, this.SIZE);
     } else {
       this.ctx.drawImage(video, 0, 0, this.SIZE, this.SIZE);
     }
 
     const imageData = this.ctx.getImageData(0, 0, this.SIZE, this.SIZE);
-    const pixels = imageData.data; // RGBA, length = SIZE*SIZE*4
-    const total = this.SIZE * this.SIZE;
+    const pixels    = imageData.data;
+    const total     = this.SIZE * this.SIZE;
 
-    // ── Derived channels ─────────────────────────────────────────────────────
     const gray = new Uint8ClampedArray(total);
     for (let i = 0; i < total; i++) {
       const r = pixels[i * 4];
@@ -130,40 +127,45 @@ export class AntiSpoofEngine {
       gray[i] = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
     }
 
-    // ── Run the four signals ─────────────────────────────────────────────────
-    const glare            = this._detectGlare(gray);
-    const texture          = this._computeLBPEntropy(gray);
-    const colorNaturalness = this._analyzeColorNaturalness(pixels, total);
-    const temporalVariance = this._computeTemporalVariance(gray);
+    // ── Five signals ─────────────────────────────────────────────────────────
+    const glare             = this._detectGlare(gray);
+    const texture           = this._computeLBPEntropy(gray);
+    const colorNaturalness  = this._analyzeColorNaturalness(pixels, total);
+    const temporalVariance  = this._computeTemporalVariance(gray);
+    const motionConsistency = this._computeMotionConsistency();
 
-    // ── Weighted combination ─────────────────────────────────────────────────
-    // Glare and texture are the most reliable discriminators; they get
-    // higher weights. Temporal variance needs several frames to warm up
-    // so it starts with a neutral score — keep its weight balanced.
+    // ── Weighted combination ──────────────────────────────────────────────────
+    // Weights: glare 0.25 | texture 0.25 | color 0.15 | temporal 0.20 | consistency 0.15
     const score = Math.round(
-      glare            * 0.30 +
-      texture          * 0.30 +
-      colorNaturalness * 0.20 +
-      temporalVariance * 0.20
+      glare            * 0.25 +
+      texture          * 0.25 +
+      colorNaturalness * 0.15 +
+      temporalVariance * 0.20 +
+      motionConsistency* 0.15
     );
 
-    // A single catastrophically low signal (strong spoof indicator) overrides
-    // the aggregate: any signal < 15 immediately classifies as spoof.
-    const anyCatastrophic = glare < 15 || texture < 15;
+    // Catastrophic single-signal overrides
+    const anyCatastrophic =
+      glare            < 15 ||
+      texture          < 15 ||
+      temporalVariance < 10;   // Near-zero motion = static image
 
-    const isReal = score >= 42 && !anyCatastrophic;
+    // ── Raised threshold: 58 (was 42) ────────────────────────────────────────
+    const isReal = score >= 58 && !anyCatastrophic;
 
-    // ── Reason string ────────────────────────────────────────────────────────
+    // ── Reason string ─────────────────────────────────────────────────────────
     let reason = "Face appears genuine";
     if (!isReal) {
-      if (glare < 20) {
-        reason = "Screen glare / reflection detected — please use your real face";
+      if (temporalVariance < 10) {
+        reason = "No natural face motion detected — static image likely";
+      } else if (motionConsistency < 20) {
+        reason = "Motion pattern too regular — possible screen or printed photo";
+      } else if (glare < 20) {
+        reason = "Screen glare / reflection detected";
       } else if (texture < 20) {
-        reason = "Skin micro-texture appears artificial (photo or screen detected)";
+        reason = "Skin micro-texture appears artificial (photo or screen)";
       } else if (colorNaturalness < 25) {
-        reason = "Unnatural colour distribution detected in face region";
-      } else if (temporalVariance < 20) {
-        reason = "No natural face motion detected — possible static image";
+        reason = "Unnatural colour distribution in face region";
       } else {
         reason = "Multiple signals indicate a non-real face";
       }
@@ -172,13 +174,14 @@ export class AntiSpoofEngine {
     return {
       isReal,
       score,
-      confidence: score >= 70 ? "high" : score >= 45 ? "medium" : "low",
+      confidence: score >= 75 ? "high" : score >= 60 ? "medium" : "low",
       reason,
       signals: {
-        glare:            Math.round(glare),
-        texture:          Math.round(texture),
-        colorNaturalness: Math.round(colorNaturalness),
-        temporalVariance: Math.round(temporalVariance),
+        glare:             Math.round(glare),
+        texture:           Math.round(texture),
+        colorNaturalness:  Math.round(colorNaturalness),
+        temporalVariance:  Math.round(temporalVariance),
+        motionConsistency: Math.round(motionConsistency),
       },
     };
   }
@@ -186,15 +189,11 @@ export class AntiSpoofEngine {
   // ── Private signal implementations ────────────────────────────────────────
 
   /**
-   * Signal 1 — Glare / Specular reflection detection.
+   * Signal 1 — Glare / Specular detection.
    *
-   * Phone and tablet screens have a glass layer that strongly reflects the
-   * room lights and any camera LED fill-light.  This produces a concentrated
-   * cluster of near-white pixels inside the face crop.  Real skin may have
-   * a small highlight on the forehead, but almost never >4% super-bright area.
-   *
-   * Threshold is empirically set at 235/255 (near-saturation) which filters
-   * normal facial highlights while catching screen hotspots.
+   * Threshold tightened: "safe zone" lowered from 4% → 1.5% super-bright
+   * pixels.  Modern anti-reflective phone screens still typically reflect
+   * ≥ 2% of ambient light as near-white hotspots in typical indoor conditions.
    */
   private _detectGlare(gray: Uint8ClampedArray): number {
     const THRESHOLD = 235;
@@ -204,26 +203,19 @@ export class AntiSpoofEngine {
     }
     const ratio = hotPixels / gray.length;
 
-    // Calibrated bounds:
-    //   < 4% → clearly real (score = 100)
-    //   4-18% → grey zone (linear interpolation)
-    //   > 18% → clearly a screen (score = 0)
-    if (ratio <= 0.04) return 100;
-    if (ratio >= 0.18) return 0;
-    return Math.round((1 - (ratio - 0.04) / 0.14) * 100);
+    // ≤ 1.5% → safe (score 100); ≥ 16% → clear spoof (score 0)
+    if (ratio <= 0.015) return 100;
+    if (ratio >= 0.16)  return 0;
+    return Math.round((1 - (ratio - 0.015) / 0.145) * 100);
   }
 
   /**
-   * Signal 2 — LBP (Local Binary Pattern) micro-texture entropy.
+   * Signal 2 — LBP micro-texture entropy.
    *
-   * The LBP of a pixel is an 8-bit code formed by thresholding its 8
-   * neighbours against the centre value.  Shannon entropy of the resulting
-   * histogram measures how diverse the local texture is.
-   *
-   * Real skin has a high-entropy LBP distribution (~6.5-7.5 bits out of 8)
-   * because pores, fine hairs and micro-wrinkles create varied patterns.
-   * Screen-rendered images and printed photos are smoother, producing a
-   * lower-entropy histogram (~4-6 bits).
+   * Threshold tightened: "definitely real" normalised entropy raised from
+   * 0.72 → 0.80.  Real skin at close range scores 0.85-0.95.
+   * A high-quality phone photo typically scores 0.70-0.82 — this change
+   * ensures borderline screen captures no longer receive a full 100 score.
    */
   private _computeLBPEntropy(gray: Uint8ClampedArray): number {
     const W = this.SIZE;
@@ -234,7 +226,6 @@ export class AntiSpoofEngine {
     for (let y = 1; y < H - 1; y++) {
       for (let x = 1; x < W - 1; x++) {
         const center = gray[y * W + x];
-        // 8 clockwise neighbours starting from top-left
         const n = [
           gray[(y - 1) * W + (x - 1)],
           gray[(y - 1) * W + x],
@@ -255,7 +246,6 @@ export class AntiSpoofEngine {
       }
     }
 
-    // Shannon entropy of the LBP histogram
     let entropy = 0;
     for (let i = 0; i < 256; i++) {
       if (histogram[i] > 0) {
@@ -264,33 +254,20 @@ export class AntiSpoofEngine {
       }
     }
 
-    // Normalise to [0, 1] then to 0-100 score
-    // entropy range [0, 8] where 8 = maximum (perfectly uniform histogram)
     const normalised = entropy / 8;
-    if (normalised >= 0.72) return 100;
-    if (normalised <= 0.38) return 0;
-    return Math.round(((normalised - 0.38) / 0.34) * 100);
+    // Tighter: real zone starts at 0.80 (was 0.72), spoof zone below 0.42 (was 0.38)
+    if (normalised >= 0.80) return 100;
+    if (normalised <= 0.42) return 0;
+    return Math.round(((normalised - 0.42) / 0.38) * 100);
   }
 
   /**
    * Signal 3 — Colour naturalness / skin-tone distribution.
-   *
-   * When we crop to the face region, the majority of pixels should fall
-   * inside a skin-tone colour space.  The classic rule-based skin detector
-   * (Kovac et al.):
-   *
-   *   R > 95, G > 40, B > 20
-   *   max(R,G,B) - min(R,G,B) > 15
-   *   |R - G| > 15
-   *   R > G  and  R > B
-   *
-   * works well here because we specifically care about faces, not arbitrary
-   * backgrounds.  A phone bezel, screen border, or paper print shifts the
-   * ratio outside 20-85%.
+   * (Unchanged — classic Kovac et al. rule-based skin detector.)
    */
   private _analyzeColorNaturalness(
     pixels: Uint8ClampedArray,
-    total: number
+    total:  number
   ): number {
     let skinPixels = 0;
     for (let i = 0; i < total; i++) {
@@ -313,33 +290,22 @@ export class AntiSpoofEngine {
     }
     const ratio = skinPixels / total;
 
-    // Healthy face crop: 25-85% skin pixels
-    // Outside this range → suspicious (too little = bezel/background; too much = uniform fill)
     if (ratio >= 0.25 && ratio <= 0.85) return 100;
-    if (ratio < 0.10 || ratio > 0.95) return 10;
+    if (ratio < 0.10 || ratio > 0.95)   return 10;
     if (ratio < 0.25) return Math.round((ratio / 0.25) * 100);
     return Math.round((1 - (ratio - 0.85) / 0.10) * 100);
   }
 
   /**
-   * Signal 4 — Temporal micro-variance (frame-to-frame motion).
+   * Signal 4 — Temporal micro-variance (raw MAD).
    *
-   * Mean Absolute Difference (MAD) of consecutive grayscale frames.
-   *
-   * Real faces always exhibit organic micro-motion: breathing shifts the
-   * head slightly, eyes saccade, skin pulses.  Average MAD: 1.0-10.0.
-   *
-   * A static printed photo: MAD ≈ 0.0-0.4 (near-zero).
-   * A screen playing a static/looped image: similar.
-   * A screen playing a video may have higher MAD but exhibits a distinctly
-   * blocky, compression-artefact noise pattern; however, the temporal
-   * variance check alone cannot fully distinguish this case — the other
-   * signals (texture, glare) compensate.
+   * Near-zero motion still immediately flags a static image.
+   * Hand tremor that used to score 100 now feeds into Signal 5 instead.
    */
   private _computeTemporalVariance(gray: Uint8ClampedArray): number {
     if (!this.prevGray) {
       this.prevGray = gray.slice();
-      return 50; // Neutral on very first frame — no history yet
+      return 50;
     }
 
     let mad = 0;
@@ -350,23 +316,55 @@ export class AntiSpoofEngine {
 
     this.prevGray = gray.slice();
     this.motionHistory.push(mad);
-    if (this.motionHistory.length > 12) this.motionHistory.shift();
+    if (this.motionHistory.length > 16) this.motionHistory.shift();
 
-    if (this.motionHistory.length < 3) return 50; // Still warming up
+    if (this.motionHistory.length < 3) return 50;
 
-    const avg =
-      this.motionHistory.reduce((a, b) => a + b, 0) / this.motionHistory.length;
+    const avg = this.motionHistory.reduce((a, b) => a + b, 0) / this.motionHistory.length;
 
-    // Calibrated ranges:
-    //   avg < 0.3 → definitely static image    → 0
-    //   0.3-0.8 → very little motion          → scale up
-    //   0.8-10 → natural motion range         → 100
-    //   10-20 → borderline (video/shaking)    → scale down
-    //   > 20 → excessive (motion blur/video)  → 25
-    if (avg < 0.3) return 0;
-    if (avg >= 0.8 && avg <= 10) return 100;
-    if (avg > 20) return 25;
-    if (avg < 0.8) return Math.round((avg / 0.8) * 100);
+    // Calibration (unchanged):
+    if (avg < 0.3)                  return 0;
+    if (avg >= 0.8 && avg <= 10)    return 100;
+    if (avg > 20)                   return 25;
+    if (avg < 0.8)                  return Math.round((avg / 0.8) * 100);
     return Math.round((1 - (avg - 10) / 10) * 75 + 25);
+  }
+
+  /**
+   * Signal 5 — Motion Consistency (NEW in v3).
+   *
+   * Coefficient of Variation (CoV = std/mean) of the recent MAD history:
+   *
+   *   Hand tremor  → near-constant MAD (regular 8-12 Hz tremor sampled at
+   *                  ~5 Hz appears as slow oscillation with low CoV ≈ 0.05-0.20)
+   *
+   *   Organic face → irregular micro-motion — breathing pauses, micro-
+   *                  expressions, eye movements create bursts with high
+   *                  CoV ≈ 0.40-0.90
+   *
+   * Therefore: LOW CoV = suspiciously regular = spoof signal.
+   * Requires at least 6 samples to produce a meaningful estimate.
+   *
+   * IMPORTANT: this signal is only meaningful when significant motion is
+   * present (avg MAD > 0.5).  When the face is nearly static we return
+   * neutral (50) to avoid double-penalising with Signal 4.
+   */
+  private _computeMotionConsistency(): number {
+    const h = this.motionHistory;
+    if (h.length < 6) return 50; // Not enough history yet
+
+    const avg = h.reduce((s, v) => s + v, 0) / h.length;
+    if (avg < 0.5) return 50; // Nearly static — let Signal 4 handle it
+
+    const variance = h.reduce((s, v) => s + (v - avg) ** 2, 0) / h.length;
+    const std      = Math.sqrt(variance);
+    const cov      = std / (avg + 1e-6);
+
+    // Calibration:
+    //   CoV < 0.20 → suspiciously consistent → spoof → score 0
+    //   CoV > 0.55 → organic irregularity    → real  → score 100
+    if (cov >= 0.55) return 100;
+    if (cov <= 0.20) return 0;
+    return Math.round(((cov - 0.20) / 0.35) * 100);
   }
 }
