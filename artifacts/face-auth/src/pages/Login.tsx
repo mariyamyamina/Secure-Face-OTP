@@ -303,17 +303,24 @@ export default function Login() {
   // Keep a ref to verifyAndLogin so runDetectionTick can call the latest version
   const verifyAndLoginRef = useRef<() => void>(() => {});
 
-  // ── Stage 4: Face Recognition ─────────────────────────────────────────────
+  // ── Stage 4: Face Recognition + Server-Side Anti-Spoof ────────────────────
   const verifyAndLogin = useCallback(async () => {
     setPageState("verifying");
     const video = webcamRef.current?.video;
     if (!video) { setErrorMsg("Camera unavailable."); setPageState("failed"); return; }
 
     try {
-      // Capture 3 frames and average descriptors — smooths noise from
-      // lighting/angle variation between individual captures.
+      // ── Capture webcam frame for server-side anti-spoofing ─────────────
+      // react-webcam's getScreenshot() returns a data-URI JPEG string.
+      // This exact frame is sent to the Python anti-spoof service which
+      // runs OpenCV-based frequency, texture, and glare analysis on it.
+      const faceImageB64: string | null = webcamRef.current?.getScreenshot() ?? null;
+
+      // ── Capture 3 face descriptors and average them ────────────────────
+      // Three samples over 600 ms smooth lighting/angle noise.
       const SAMPLES     = 3;
       const descriptors: Float32Array[] = [];
+      let   capturedBounds: { x: number; y: number; width: number; height: number } | null = null;
 
       for (let i = 0; i < SAMPLES; i++) {
         if (i > 0) await new Promise(r => setTimeout(r, 300));
@@ -324,7 +331,14 @@ export default function Login() {
           )
           .withFaceLandmarks()
           .withFaceDescriptor();
-        if (det) descriptors.push(det.descriptor);
+        if (det) {
+          descriptors.push(det.descriptor);
+          // Store face bounds from first successful detection for server-side crop
+          if (!capturedBounds) {
+            const box = det.detection.box;
+            capturedBounds = { x: box.x, y: box.y, width: box.width, height: box.height };
+          }
+        }
       }
 
       if (descriptors.length === 0) {
@@ -345,8 +359,11 @@ export default function Login() {
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({
           email,
-          face_descriptor: Array.from(avgDescriptor),
-          liveness_passed: true,
+          face_descriptor:  Array.from(avgDescriptor),
+          liveness_passed:  true,
+          // Server-side anti-spoof: full webcam frame + face crop region
+          face_image_b64:   faceImageB64,
+          face_bounds:      capturedBounds,
         }),
       });
       const data = await res.json();
@@ -358,7 +375,9 @@ export default function Login() {
         // Start OTP flow asynchronously so OTP UI appears immediately
         sendOtp();
       } else {
-        setErrorMsg(data.error || "Authentication failed.");
+        // Surface the spoof-specific message when available
+        const errMsg = data.error || "Authentication failed.";
+        setErrorMsg(errMsg);
         setPageState("failed");
       }
     } catch {

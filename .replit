@@ -30,6 +30,10 @@ args = "API Server"
 task = "workflow.run"
 args = "Face Auth"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Anti-Spoof Service"
+
 [[workflows.workflow]]
 name = "API Server"
 author = "agent"
@@ -53,6 +57,18 @@ waitForPort = 19434
 
 [workflows.workflow.metadata]
 outputType = "webview"
+
+[[workflows.workflow]]
+name = "Anti-Spoof Service"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PORT=8000 python3 artifacts/anti-spoof/main.py"
+waitForPort = 8000
+
+[workflows.workflow.metadata]
+outputType = "console"
 
 [agent]
 stack = "PNPM_WORKSPACE"

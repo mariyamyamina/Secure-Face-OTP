@@ -36,16 +36,48 @@ artifacts-monorepo/
 └── package.json            # Root package with hoisted devDeps
 ```
 
-## Application: Intelligent Anti-Spoof Face Authentication System
+## Application: AuraAuth — Intelligent Anti-Spoof Face Authentication System
 
-### Features
-- **Landing Page**: Hero section, feature cards, how-it-works steps
-- **Registration Page**: Webcam capture, face-api.js face detection & 128D descriptor extraction
-- **Login Page**: Placeholder page (OTP-based login coming soon)
+### Services
+| Service | Port | Stack |
+|---------|------|-------|
+| Face Auth (frontend) | 19434 | React + Vite |
+| API Server (backend) | 8080 | Express 5 + TypeScript |
+| Anti-Spoof Service | 8000 | Python FastAPI + OpenCV |
+
+### Authentication Pipeline
+```
+Camera → [Client-Side] → Anti-Spoof (JS) + Liveness Checks
+       → [Server-Side] → POST /api/login-face
+                       → Anti-Spoof Service (Python/OpenCV)  ← NEW
+                       → Face Recognition (Euclidean distance)
+                       → OTP Email Verification
+```
+
+### Anti-Spoofing (Server-Side Python — `artifacts/anti-spoof/main.py`)
+Five OpenCV-based signals analysed per login attempt:
+1. **FFT Periodic Pattern** — detects screen pixel-grid frequency artifacts
+2. **LBP Texture Entropy** — real skin has richer micro-texture than screen renders
+3. **Gradient Block Uniformity** — screen rendering produces suspiciously uniform local gradients
+4. **Specular Highlight Detection** — screen glass produces concentrated glare hotspots
+5. **YCbCr Skin Colour Ratio** — validates natural skin colour distribution
+
+Spoof threshold: combined score ≥ 52 → FAKE → 403 rejected.
+
+### Anti-Spoofing (Client-Side JS — `artifacts/face-auth/src/lib/antiSpoofing.ts`)
+Five signals run every other detection tick (200 ms intervals):
+- Glare / LBP texture / Colour naturalness / Temporal MAD / Motion CoV
+
+### Liveness Detection (`artifacts/face-auth/src/lib/livenessDetector.ts`)
+Four behavioural proofs required (hardened thresholds):
+- Blink: full close+reopen cycle (single EAR drop not sufficient)
+- Lip: 14 px open threshold (prevents detection-noise trigger)
+- Head: 18 px nose-tip displacement (prevents phone-tilt trigger)
+- Texture: MAD ≥ 2.0 in 5/8 samples
 
 ### API Endpoints
 - `POST /api/register-face` - Register user with email, hashed password, and face descriptor
-- `POST /api/login-face` - Match face descriptor for authentication (euclidean distance threshold 0.6)
+- `POST /api/login-face` - Pipeline: liveness check → server-side anti-spoof → face recognition
 - `GET /api/healthz` - Health check
 
 ### Database Schema

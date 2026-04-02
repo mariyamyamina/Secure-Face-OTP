@@ -8,12 +8,56 @@ const router: IRouter = Router();
 
 const SALT_ROUNDS = 10;
 
-// Euclidean distance between two face descriptor vectors
+/** Euclidean distance between two face descriptor vectors. */
 function euclideanDistance(a: number[], b: number[]): number {
   return Math.sqrt(a.reduce((sum, val, i) => sum + (val - b[i]) ** 2, 0));
 }
 
-// POST /api/register-face - Register a new user with face descriptor
+// ── Anti-Spoof Service Integration ────────────────────────────────────────────
+
+const ANTI_SPOOF_URL = process.env.ANTI_SPOOF_URL ?? "http://localhost:8000";
+
+/**
+ * Call the Python anti-spoofing service.
+ *
+ * Returns the parsed JSON response, or null if the service is unreachable.
+ * A null response is treated as SPOOF REJECTED to enforce a strict security
+ * posture — the Python service must be running for logins to proceed.
+ */
+async function checkAntiSpoof(
+  imageB64: string,
+  faceBounds?: { x: number; y: number; width: number; height: number },
+): Promise<{ is_real: boolean; spoof_score: number; reason: string; signals: Record<string, number> } | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000); // 5 s timeout
+
+    const res = await fetch(`${ANTI_SPOOF_URL}/analyze`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ image_b64: imageB64, face_bounds: faceBounds ?? null }),
+      signal:  controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[anti-spoof] Service returned ${res.status}: ${body}`);
+      return null;
+    }
+    return await res.json() as { is_real: boolean; spoof_score: number; reason: string; signals: Record<string, number> };
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
+      console.error("[anti-spoof] Service timed out after 5 s");
+    } else {
+      console.error("[anti-spoof] Service unreachable:", err instanceof Error ? err.message : err);
+    }
+    return null;
+  }
+}
+
+// ── POST /api/register-face ───────────────────────────────────────────────────
+
 router.post("/register-face", async (req, res) => {
   const parsed = RegisterFaceBody.safeParse(req.body);
   if (!parsed.success) {
@@ -54,7 +98,8 @@ router.post("/register-face", async (req, res) => {
   }
 });
 
-// POST /api/login-face - Authenticate user with face descriptor + liveness check
+// ── POST /api/login-face ──────────────────────────────────────────────────────
+
 router.post("/login-face", async (req, res) => {
   const parsed = LoginFaceBody.safeParse(req.body);
   if (!parsed.success) {
@@ -64,11 +109,63 @@ router.post("/login-face", async (req, res) => {
 
   const { email, face_descriptor, liveness_passed } = parsed.data;
 
+  // ── Client-side liveness check (first gate) ───────────────────────────────
   if (!liveness_passed) {
     res.status(401).json({ error: "Liveness verification failed" });
     return;
   }
 
+  // ── Server-side anti-spoofing (second gate, mandatory) ───────────────────
+  // The client must include a base64-encoded webcam frame for server-side
+  // analysis.  Without it the request is rejected — this prevents clients
+  // that have been tampered with from bypassing the anti-spoof layer.
+  const faceImageB64: string | null =
+    typeof req.body.face_image_b64 === "string" && req.body.face_image_b64.length > 100
+      ? req.body.face_image_b64
+      : null;
+
+  const faceBounds =
+    req.body.face_bounds &&
+    typeof req.body.face_bounds.x === "number"
+      ? req.body.face_bounds as { x: number; y: number; width: number; height: number }
+      : undefined;
+
+  if (!faceImageB64) {
+    console.warn(`[anti-spoof] No face image provided by ${email} — rejecting`);
+    res.status(400).json({
+      error:  "Face image required for server-side anti-spoofing verification.",
+      detail: "The client must include face_image_b64 in the request.",
+    });
+    return;
+  }
+
+  const spoofResult = await checkAntiSpoof(faceImageB64, faceBounds);
+
+  if (spoofResult === null) {
+    // Service unreachable — strict policy: reject login
+    console.error(`[anti-spoof] Service unavailable — blocking login for ${email}`);
+    res.status(503).json({
+      error: "Anti-spoofing service temporarily unavailable. Please try again in a moment.",
+    });
+    return;
+  }
+
+  console.log(
+    `[anti-spoof] user=${email}  real=${spoofResult.is_real}  score=${spoofResult.spoof_score}` +
+    `  signals=${JSON.stringify(spoofResult.signals)}`,
+  );
+
+  if (!spoofResult.is_real) {
+    res.status(403).json({
+      error:       "Spoofing attempt detected (mobile screen / photo / video replay). Access denied.",
+      spoof_score: spoofResult.spoof_score,
+      reason:      spoofResult.reason,
+      signals:     spoofResult.signals,
+    });
+    return;
+  }
+
+  // ── Face recognition (third gate) ────────────────────────────────────────
   try {
     const users = await db
       .select()
@@ -98,24 +195,27 @@ router.post("/login-face", async (req, res) => {
     }
 
     const distance = euclideanDistance(face_descriptor, storedDescriptor);
-    // face-api.js recommends 0.6 as the recognition threshold.
-    // 0.5 is too strict and rejects real users with slight lighting/angle variation.
     const THRESHOLD = 0.6;
 
-    console.log(`[face-match] user=${email} distance=${distance.toFixed(4)} threshold=${THRESHOLD} matched=${distance <= THRESHOLD}`);
+    console.log(
+      `[face-match] user=${email} distance=${distance.toFixed(4)} threshold=${THRESHOLD} matched=${distance <= THRESHOLD}`,
+    );
 
     if (distance > THRESHOLD) {
-      res.status(401).json({ error: "Face does not match. Please try again.", distance: parseFloat(distance.toFixed(4)) });
+      res.status(401).json({
+        error:    "Face does not match. Please try again.",
+        distance: parseFloat(distance.toFixed(4)),
+      });
       return;
     }
 
     const confidence = Math.max(0, Math.round((1 - distance / THRESHOLD) * 100));
 
     res.status(200).json({
-      message: "Face verified. OTP will be sent to your email.",
+      message:      "Face verified. OTP will be sent to your email.",
       face_matched: true,
       confidence,
-      name: user.name ?? null,
+      name:         user.name ?? null,
     });
   } catch (err) {
     console.error("Login error:", err);
@@ -123,7 +223,8 @@ router.post("/login-face", async (req, res) => {
   }
 });
 
-// POST /api/login - Email + password login
+// ── POST /api/login ───────────────────────────────────────────────────────────
+
 router.post("/login", async (req, res) => {
   const { email, password } = req.body ?? {};
   if (!email || typeof email !== "string" || !password || typeof password !== "string") {
@@ -160,8 +261,8 @@ router.post("/login", async (req, res) => {
 
     res.status(200).json({
       message: "Login successful.",
-      email: user.email,
-      name: user.name ?? null,
+      email:   user.email,
+      name:    user.name ?? null,
     });
   } catch (err) {
     console.error("Password login error:", err);
