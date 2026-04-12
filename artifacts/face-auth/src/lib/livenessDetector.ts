@@ -1,9 +1,9 @@
 /**
- * Liveness Detector  (v2 — spoof-hardened)
+ * Liveness Detector  (v3 — replay-resistant + directional head challenge)
  *
  * Four behavioural proofs that a real, physically present person is in front
- * of the camera.  Each check has been hardened against the most common
- * spoofing vectors:
+ * of the camera.  v3 adds a RANDOMISED DIRECTIONAL HEAD CHALLENGE to defeat
+ * video-replay attacks.
  *
  * ── Why the old thresholds failed ──────────────────────────────────────────
  *
@@ -24,15 +24,22 @@
  *  • Blink: requires a FULL CYCLE — EAR drops AND then recovers.
  *    Single noisy readings can't create a drop+recovery pattern.
  *
- *  • Lip:   LIP_OPEN_PX raised from 6 → 14.  A photo with a slightly-open
+ *  • Lip: LIP_OPEN_PX raised from 6 → 14.  A photo with a slightly-open
  *    mouth (gap ≈ 8-10 px) plus ±3 px noise can no longer reach 14 px.
  *
- *  • Head:  HEAD_MOVE_PX raised from 8 → 18.  Requires a deliberate turn,
- *    not just phone tilt or landmark jitter.
+ *  • Head (v3): DIRECTIONAL — the detector is given a random target direction
+ *    ("left" or "right") each authentication session.  The nose tip must
+ *    move ≥ 18 px IN THAT SPECIFIC DIRECTION.  A video replay would need to
+ *    match the direction, which is unknown before the session starts.
  *
- *  • Texture: MAD threshold raised from 1.2 → 2.0.  Requires stronger
- *    organic micro-motion; compressed-video or phone-tremor noise typically
- *    produces inconsistent MAD that rarely sustains above 2.0.
+ *    Coordinate note: face-api reads the raw (non-mirrored) video.
+ *    When the user turns their head to THEIR LEFT, the nose tip moves to the
+ *    CAMERA'S RIGHT → raw-video x INCREASES.
+ *    So: user-left ↔ dx > 0;  user-right ↔ dx < 0.
+ *
+ *  • Texture: MAD threshold raised from 1.2 → 2.0.  Organic face micro-motion
+ *    at normal breathing easily exceeds 2.0 px; phone-screen tremor (rigid,
+ *    compressed) does not sustain this consistently.
  *    Window tightened: 5/8 samples must pass (was 4/6).
  */
 
@@ -41,10 +48,10 @@ import type * as faceapi from "@vladmandic/face-api";
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /** Blink: EAR must drop to ≤ this fraction of its rolling max. */
-const BLINK_DROP_RATIO = 0.68;       // Was 0.75 — require a more pronounced blink
+const BLINK_DROP_RATIO     = 0.68;
 
 /** Blink: EAR must recover to ≥ this fraction of rolling max after the drop. */
-const BLINK_RECOVERY_RATIO = 0.88;   // Eyes must clearly reopen
+const BLINK_RECOVERY_RATIO = 0.88;
 
 /** EAR rolling history size. */
 const EAR_HISTORY_SIZE = 14;
@@ -53,35 +60,30 @@ const EAR_HISTORY_SIZE = 14;
 const EAR_BASELINE_MIN = 0.18;
 
 /**
- * Lip OPEN threshold.  Raised from 6 → 14 px.
- * A static photo showing a slightly open mouth (≈ 8-10 px + ±3 px noise)
- * can no longer reach this threshold without a real, deliberate mouth opening.
+ * Lip OPEN threshold (pixels).
+ * A static photo with slightly open mouth (≈ 8-10 px + ±3 px noise) cannot
+ * reach 14 px without a real, deliberate mouth opening.
  */
-const LIP_OPEN_PX = 14;
-
-/** Lip CLOSED threshold. */
+const LIP_OPEN_PX  = 14;
 const LIP_CLOSE_PX = 4;
 
 /**
- * Head movement: nose tip must shift ≥ 18 px from baseline.
- * Raised from 8 → 18 px.  Requires a deliberate head turn; phone tilt or
- * landmark noise (≤ 4 px) cannot satisfy this.
+ * Head movement: nose tip must shift ≥ 18 px IN THE REQUIRED DIRECTION.
+ * Raised from 8 → 18 px; phone tilt or landmark noise (≤ 4 px) cannot
+ * satisfy this, and the DIRECTION requirement defeats video replay.
  */
 const HEAD_MOVE_PX = 18;
 
 /**
  * Skin texture: minimum MAD (Mean Absolute Difference) between frames.
  * Raised from 1.2 → 2.0.  Organic face micro-motion at normal breathing
- * easily exceeds 2.0 px; phone-screen tremor (rigid, compressed) does not
+ * easily exceeds 2.0; phone-screen tremor (rigid, compressed) does not
  * sustain this consistently.
  */
 const TEXTURE_MAD_THRESHOLD = 2.0;
 
-/** Texture window size (recent frames to evaluate). */
-const TEXTURE_WINDOW = 8;
-
-/** Number of samples in the window that must exceed the MAD threshold. */
-const TEXTURE_PASSING_MIN = 5;       // Was 4/6 — tighter: 5/8
+const TEXTURE_WINDOW      = 8;
+const TEXTURE_PASSING_MIN = 5;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -95,9 +97,7 @@ export interface LivenessState {
 export interface LivenessUpdateResult {
   state:     LivenessState;
   allPassed: boolean;
-  /** Current EAR value (for debug display) */
   ear:       number | null;
-  /** Current lip gap in pixels (for debug display) */
   lipGap:    number | null;
 }
 
@@ -107,10 +107,6 @@ function ptDist(a: faceapi.Point, b: faceapi.Point): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-/**
- * Eye Aspect Ratio for a 6-point eye slice.
- * [0] outer corner  [1][2] upper lid  [3] inner corner  [4][5] lower lid
- */
 function computeEAR(eye: faceapi.Point[]): number {
   const v1 = ptDist(eye[1], eye[5]);
   const v2 = ptDist(eye[2], eye[4]);
@@ -129,14 +125,8 @@ export class LivenessDetector {
   };
 
   // ── Blink state ──────────────────────────────────────────────────────────
-  private earHistory:    number[] = [];
-  /**
-   * Two-phase blink detection:
-   *  "open"    → baseline established, waiting for EAR drop
-   *  "closing" → EAR dropped below threshold, recording minimum
-   *  "closed"  → waiting for EAR recovery (confirm full blink cycle)
-   */
-  private blinkPhase:         "open" | "closing" | "closed" = "open";
+  private earHistory:         number[] = [];
+  private blinkPhase:         "open" | "closing" = "open";
   private minEarDuringBlink:  number = 1;
 
   // ── Lip state ────────────────────────────────────────────────────────────
@@ -144,21 +134,40 @@ export class LivenessDetector {
   private lipWasClosed: boolean = false;
 
   // ── Head state ───────────────────────────────────────────────────────────
-  private noseBaseline: { x: number; y: number } | null = null;
+  private noseBaseline:  { x: number; y: number } | null = null;
+  /**
+   * The direction the user must turn their head.
+   * "left"  = user's physical left  → raw-video dx > 0 (camera's right)
+   * "right" = user's physical right → raw-video dx < 0 (camera's left)
+   *
+   * Randomised per session — defeats video replay attacks that can't
+   * anticipate which direction will be required.
+   */
+  private headDirection: "left" | "right";
 
   // ── Texture state ────────────────────────────────────────────────────────
-  private offCanvas:    HTMLCanvasElement;
-  private offCtx:       CanvasRenderingContext2D;
-  private prevPixels:   Uint8ClampedArray | null = null;
-  private textureScores:number[] = [];
+  private offCanvas:   HTMLCanvasElement;
+  private offCtx:      CanvasRenderingContext2D;
+  private prevPixels:  Uint8ClampedArray | null = null;
+  private textureScores: number[] = [];
 
-  constructor() {
+  constructor(headDirection: "left" | "right" = "left") {
+    this.headDirection = headDirection;
     this.offCanvas = document.createElement("canvas");
     this.offCanvas.width  = 48;
     this.offCanvas.height = 48;
     const ctx = this.offCanvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) throw new Error("LivenessDetector: Canvas 2D context unavailable");
     this.offCtx = ctx;
+  }
+
+  /** Update the required head direction (call before reset or at session start). */
+  setHeadDirection(dir: "left" | "right"): void {
+    this.headDirection = dir;
+  }
+
+  getHeadDirection(): "left" | "right" {
+    return this.headDirection;
   }
 
   /** Full reset — call when liveness monitoring restarts. */
@@ -177,6 +186,8 @@ export class LivenessDetector {
     this.noseBaseline      = null;
     this.prevPixels        = null;
     this.textureScores     = [];
+    // Note: headDirection is NOT reset here — it is set by the caller (Login)
+    // before reset() to ensure the direction is known before monitoring starts.
   }
 
   /**
@@ -197,7 +208,6 @@ export class LivenessDetector {
       const pts = det.landmarks.positions;
 
       // ── 1. Eye Blink (two-phase: close → reopen) ─────────────────────────
-      // 68-pt map: left eye = pts[36..41], right eye = pts[42..47]
       const leftEye  = pts.slice(36, 42) as faceapi.Point[];
       const rightEye = pts.slice(42, 48) as faceapi.Point[];
       ear = (computeEAR(leftEye) + computeEAR(rightEye)) / 2;
@@ -207,27 +217,21 @@ export class LivenessDetector {
         if (this.earHistory.length > EAR_HISTORY_SIZE) this.earHistory.shift();
 
         if (this.earHistory.length >= 5) {
-          const rollingMax    = Math.max(...this.earHistory);
-          const blinkThresh   = rollingMax * BLINK_DROP_RATIO;
-          const recoveryThresh= rollingMax * BLINK_RECOVERY_RATIO;
+          const rollingMax     = Math.max(...this.earHistory);
+          const blinkThresh    = rollingMax * BLINK_DROP_RATIO;
+          const recoveryThresh = rollingMax * BLINK_RECOVERY_RATIO;
 
-          // Only process if we have a solid open-eye baseline
           if (rollingMax > EAR_BASELINE_MIN) {
             switch (this.blinkPhase) {
               case "open":
                 if (ear <= blinkThresh) {
-                  // Phase 1: EAR dropped — blink is starting
                   this.blinkPhase        = "closing";
                   this.minEarDuringBlink = ear;
                 }
                 break;
-
               case "closing":
-                // Track the lowest point during the blink
                 if (ear < this.minEarDuringBlink) this.minEarDuringBlink = ear;
                 if (ear >= recoveryThresh) {
-                  // Eyes reopened: complete blink cycle confirmed
-                  // Only count if the minimum EAR was sufficiently low
                   if (this.minEarDuringBlink <= blinkThresh) {
                     this.state = { ...this.state, blinkDetected: true };
                   }
@@ -240,12 +244,9 @@ export class LivenessDetector {
       }
 
       // ── 2. Lip Movement ───────────────────────────────────────────────────
-      // Inner mouth: pts[60..67]
-      // Vertical gap: pts[62] (top inner lip) vs pts[66] (bottom inner lip)
       lipGap = Math.abs(pts[62].y - pts[66].y);
 
       if (!this.state.lipMovementDetected) {
-        // Require a CLEARLY open mouth (14 px vs. photo noise ≈ ±3 px).
         if (lipGap > LIP_OPEN_PX)  this.lipWasOpen   = true;
         if (lipGap < LIP_CLOSE_PX) this.lipWasClosed = true;
         if (this.lipWasOpen && this.lipWasClosed) {
@@ -253,17 +254,27 @@ export class LivenessDetector {
         }
       }
 
-      // ── 3. Head Movement ──────────────────────────────────────────────────
-      // Nose tip = pts[30].  Threshold raised to 18 px; phone tilt or
-      // landmark noise (< 5 px) cannot reach this.
+      // ── 3. Directional Head Movement ──────────────────────────────────────
+      //
+      // Coordinate frame: face-api reads the RAW (non-mirrored) video stream.
+      // The display may be CSS-mirrored, but pixel data is always raw.
+      //
+      // Physical mapping (front-facing camera):
+      //   User turns to THEIR LEFT  → nose moves to camera's RIGHT → raw dx > 0
+      //   User turns to THEIR RIGHT → nose moves to camera's LEFT  → raw dx < 0
+      //
+      // The required direction is randomised per session and stored in
+      // this.headDirection.  A pre-recorded replay cannot know which direction
+      // will be required; an attacker must perform the correct turn live.
       if (!this.state.headMovementDetected) {
         const nosePt = pts[30];
         if (!this.noseBaseline) {
           this.noseBaseline = { x: nosePt.x, y: nosePt.y };
         } else {
-          const dx = Math.abs(nosePt.x - this.noseBaseline.x);
-          const dy = Math.abs(nosePt.y - this.noseBaseline.y);
-          if (dx > HEAD_MOVE_PX || dy > HEAD_MOVE_PX) {
+          const dx = nosePt.x - this.noseBaseline.x; // SIGNED displacement
+          const requiredDx =
+            this.headDirection === "left" ? dx : -dx;   // positive when correct
+          if (requiredDx > HEAD_MOVE_PX) {
             this.state = { ...this.state, headMovementDetected: true };
           }
         }
@@ -271,10 +282,6 @@ export class LivenessDetector {
     }
 
     // ── 4. Skin Texture (temporal MAD — spoof-hardened) ───────────────────
-    // Runs on raw video regardless of face detection.
-    // Threshold raised to 2.0 and window tightened to 5/8.
-    // This ensures phone-tremor noise (rigid, inconsistent) cannot reliably
-    // sustain the MAD above 2.0 across 5 consecutive samples.
     if (!this.state.textureDetected) {
       this.offCtx.drawImage(video, 0, 0, 48, 48);
       const imgData = this.offCtx.getImageData(0, 0, 48, 48).data;
