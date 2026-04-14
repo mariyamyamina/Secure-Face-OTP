@@ -49,15 +49,17 @@ import { generateOTP, sendOTPEmail, emailJSConfigured } from "@/lib/emailService
 import { useUser } from "@/context/UserContext";
 import { LivenessDetector, type LivenessState } from "@/lib/livenessDetector";
 import { AntiSpoofEngine, type SpoofSignals } from "@/lib/antiSpoofing";
+import { ServerLivenessClient, type ServerLivenessChecks, type ServerLivenessFrameResult } from "@/lib/serverLiveness";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-const MODEL_URL            = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
-const DETECTION_INTERVAL_MS = 200;   // Face detection tick rate
-const LIVENESS_TIMEOUT_S   = 30;     // Total time allowed for liveness
-const ANTI_SPOOF_INTERVAL  = 2;      // Run anti-spoof every N-th detection tick
-const ANTI_SPOOF_WARMUP    = 4;      // Skip anti-spoof for first N ticks (warm-up)
-const SPOOF_REJECT_COUNT   = 2;      // Consecutive "spoof" readings before rejection
+const MODEL_URL              = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
+const DETECTION_INTERVAL_MS  = 200;   // Face detection tick rate
+const LIVENESS_TIMEOUT_S     = 45;    // Total time allowed for liveness (extended for server checks)
+const ANTI_SPOOF_INTERVAL    = 2;     // Run anti-spoof every N-th detection tick
+const ANTI_SPOOF_WARMUP      = 4;     // Skip anti-spoof for first N ticks (warm-up)
+const SPOOF_REJECT_COUNT     = 2;     // Consecutive "spoof" readings before rejection
+const SERVER_FRAME_INTERVAL  = 5;     // Send frame to MediaPipe server every N ticks
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -71,14 +73,20 @@ type PageState =
   | "success"
   | "failed";
 
-// ── Instruction sequence for liveness ─────────────────────────────────────────
+// ── Instruction sequence for liveness (built dynamically with head direction) ──
 
-const INSTRUCTIONS = [
-  { key: "blinkDetected"        as const, text: "👁  Please blink your eyes naturally" },
-  { key: "lipMovementDetected"  as const, text: "👄  Open and close your mouth slightly" },
-  { key: "headMovementDetected" as const, text: "↔️  Gently turn your head left or right" },
-  { key: "textureDetected"      as const, text: "✅  Hold still — detecting skin texture…" },
-];
+function buildInstructions(headDir: "left" | "right" | "up") {
+  const headText =
+    headDir === "up"    ? "⬆️  Slowly tilt your head upward" :
+    headDir === "left"  ? "⬅️  Slowly turn your head to the LEFT" :
+                          "➡️  Slowly turn your head to the RIGHT";
+  return [
+    { key: "blinkDetected"        as const, text: "👁  Blink your eyes once naturally" },
+    { key: "lipMovementDetected"  as const, text: "👄  Open and then close your mouth" },
+    { key: "headMovementDetected" as const, text: headText },
+    { key: "textureDetected"      as const, text: "✅  Hold still — detecting skin texture…" },
+  ];
+}
 
 // ── Component ──────────────────────────────────────────────────────────────────
 
@@ -121,6 +129,14 @@ export default function Login() {
   const [debugEAR, setDebugEAR] = useState<number | null>(null);
   const [debugLip, setDebugLip] = useState<number | null>(null);
 
+  // ── Server-side MediaPipe liveness state ──────────────────────────────────
+  const [serverChecks,    setServerChecks]    = useState<ServerLivenessChecks | null>(null);
+  const [serverScore,     setServerScore]     = useState<number | null>(null);
+  const [serverIsLive,    setServerIsLive]    = useState(false);
+  const [serverFrameData, setServerFrameData] = useState<ServerLivenessFrameResult | null>(null);
+  const [serverAvailable, setServerAvailable] = useState(true);
+  const [headChallenge,   setHeadChallenge]   = useState<"left" | "right" | "up">("left");
+
   // ── Stage 2: Anti-spoofing state (for UI rendering) ──────────────────────
   const [antiSpoofScore,   setAntiSpoofScore]   = useState<number | null>(null);
   const [antiSpoofSignals, setAntiSpoofSignals] = useState<SpoofSignals | null>(null);
@@ -137,8 +153,10 @@ export default function Login() {
 
   // ── Stage 2 & 3 engine refs ──────────────────────────────────────────────
   // These are class instances so they hold their own state internally.
-  const livenessDetector   = useRef<LivenessDetector>(new LivenessDetector());
-  const antiSpoofEngine    = useRef<AntiSpoofEngine>(new AntiSpoofEngine());
+  const livenessDetector     = useRef<LivenessDetector>(new LivenessDetector());
+  const antiSpoofEngine      = useRef<AntiSpoofEngine>(new AntiSpoofEngine());
+  const serverLivenessClient = useRef<ServerLivenessClient>(new ServerLivenessClient());
+  const serverAllPassedRef   = useRef(false);
 
   // ── Per-session counters ─────────────────────────────────────────────────
   const tickCount            = useRef(0);
@@ -176,13 +194,15 @@ export default function Login() {
   // ── Full reset → camera-ready ────────────────────────────────────────────
   const resetLiveness = useCallback(() => {
     stopAll();
-    // Reset both engine instances
+    // Reset all engine instances
     livenessDetector.current.reset();
     antiSpoofEngine.current.reset();
+    serverLivenessClient.current.reset();
     // Reset counters
     tickCount.current             = 0;
     consecutiveSpoofCount.current = 0;
     allPassedRef.current          = false;
+    serverAllPassedRef.current    = false;
     // Reset React state
     const blank: LivenessState = {
       blinkDetected: false, lipMovementDetected: false,
@@ -194,6 +214,11 @@ export default function Login() {
     setAntiSpoofSignals(null);
     setDebugEAR(null);
     setDebugLip(null);
+    setServerChecks(null);
+    setServerScore(null);
+    setServerIsLive(false);
+    setServerFrameData(null);
+    setServerAvailable(true);
     setTimeLeft(LIVENESS_TIMEOUT_S);
     setErrorMsg("");
     setSuccessMsg("");
@@ -359,11 +384,13 @@ export default function Login() {
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({
           email,
-          face_descriptor:  Array.from(avgDescriptor),
-          liveness_passed:  true,
+          face_descriptor:       Array.from(avgDescriptor),
+          liveness_passed:       true,
           // Server-side anti-spoof: full webcam frame + face crop region
-          face_image_b64:   faceImageB64,
-          face_bounds:      capturedBounds,
+          face_image_b64:        faceImageB64,
+          face_bounds:           capturedBounds,
+          // Server-side MediaPipe liveness session (if available)
+          liveness_session_id:   serverLivenessClient.current.currentSessionId ?? undefined,
         }),
       });
       const data = await res.json();
@@ -439,7 +466,7 @@ export default function Login() {
         }
       }
 
-      // ── STAGE 3: Liveness ────────────────────────────────────────────────
+      // ── STAGE 3a: Client-side Liveness (face-api.js) ─────────────────────
       const livenessResult = livenessDetector.current.update(det ?? null, video);
 
       setLiveness(prev => {
@@ -458,8 +485,35 @@ export default function Login() {
 
       allPassedRef.current = livenessResult.allPassed;
 
+      // ── STAGE 3b: Server-side Liveness (MediaPipe — every N ticks) ────────
+      // Fire-and-forget: don't block the detection loop; update state asynchronously.
+      if (
+        tickCount.current % SERVER_FRAME_INTERVAL === 0 &&
+        serverLivenessClient.current.hasSession &&
+        serverAvailable
+      ) {
+        const screenshot = webcamRef.current?.getScreenshot() ?? null;
+        if (screenshot) {
+          serverLivenessClient.current.sendFrame(screenshot).then(result => {
+            if (!result) return;
+            setServerFrameData(result);
+            setServerChecks({ ...result.checks });
+            setServerScore(result.liveness_score);
+            if (result.is_live && !serverAllPassedRef.current) {
+              serverAllPassedRef.current = true;
+              setServerIsLive(true);
+            }
+          }).catch(() => {});
+        }
+      }
+
       // ── STAGE 4 trigger ───────────────────────────────────────────────────
-      if (livenessResult.allPassed && monitoringActive.current) {
+      // Require BOTH client-side AND server-side liveness to pass.
+      // If server is unavailable, fall back to client-side only.
+      const serverGatePassed = !serverAvailable || serverAllPassedRef.current;
+      const allPassed = livenessResult.allPassed && serverGatePassed;
+
+      if (allPassed && monitoringActive.current) {
         stopAll();
         verifyAndLoginRef.current();
       }
@@ -469,7 +523,7 @@ export default function Login() {
     } finally {
       detectionRunning.current = false;
     }
-  }, [stopAll]);
+  }, [stopAll, serverAvailable]);
 
   // ── Start liveness monitoring ─────────────────────────────────────────────
   const startMonitoring = useCallback(() => {
@@ -481,6 +535,16 @@ export default function Login() {
     monitoringActive.current = true;
     setPageState("monitoring");
     setTimeLeft(LIVENESS_TIMEOUT_S);
+
+    // Kick off server-side liveness session (non-blocking)
+    serverLivenessClient.current.start().then(result => {
+      const dir = result.headDirection;
+      setHeadChallenge(dir);
+      livenessDetector.current.setHeadDirection(dir === "up" ? "left" : dir);
+    }).catch(() => {
+      setServerAvailable(false);
+      serverAllPassedRef.current = true; // fallback: skip server gate
+    });
 
     // Countdown — 1 tick per second
     countdownInterval.current = setInterval(() => {
@@ -579,15 +643,21 @@ export default function Login() {
   }, [stopAll]);
 
   // ── Derived display values ────────────────────────────────────────────────
+  const INSTRUCTIONS       = buildInstructions(headChallenge);
   const passedCount        = Object.values(liveness).filter(Boolean).length;
   const activeInstruction  = pageState === "monitoring"
     ? INSTRUCTIONS.find(i => !liveness[i.key])?.text ?? "✅ All checks done!"
     : null;
 
+  const headHint =
+    headChallenge === "up"    ? "Tilt head upward"        :
+    headChallenge === "left"  ? "Turn head to your LEFT"  :
+                                "Turn head to your RIGHT";
+
   const checks = [
-    { key: "blinkDetected"        as const, label: "Eye Blink",         icon: Eye,    hint: "Please blink your eyes" },
+    { key: "blinkDetected"        as const, label: "Eye Blink",         icon: Eye,    hint: "Blink your eyes once" },
     { key: "lipMovementDetected"  as const, label: "Lip Movement",      icon: Smile,  hint: "Open and close your mouth" },
-    { key: "headMovementDetected" as const, label: "Head Movement",     icon: Move,   hint: "Move your head slightly" },
+    { key: "headMovementDetected" as const, label: "Head Movement",     icon: Move,   hint: headHint },
     { key: "textureDetected"      as const, label: "Real Skin Texture", icon: Layers, hint: "Hold still in frame" },
   ];
 
@@ -972,33 +1042,70 @@ export default function Login() {
                 )}
 
                 {/* Developer debug panel */}
-                {pageState === "monitoring" && (debugEAR !== null || debugLip !== null) && (
+                {pageState === "monitoring" && (
                   <motion.div
                     initial={{ opacity: 0 }} animate={{ opacity: 1 }}
                     className="glass-panel rounded-2xl p-4 border-white/5 bg-black/40"
                   >
                     <div className="flex items-center gap-2 mb-3">
                       <Activity className="w-4 h-4 text-indigo-400" />
-                      <span className="text-xs font-mono text-gray-400 uppercase tracking-wider">Live Debug</span>
+                      <span className="text-xs font-mono text-gray-400 uppercase tracking-wider">Live Biometrics</span>
+                      {serverAvailable && (
+                        <span className="ml-auto text-xs text-purple-400 font-mono">MediaPipe</span>
+                      )}
                     </div>
-                    <div className="space-y-2 font-mono text-xs">
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 font-mono text-xs">
+                      {/* Client-side (face-api) */}
                       {debugEAR !== null && (
-                        <div className="flex justify-between text-gray-400">
-                          <span>Eye Aspect Ratio (EAR)</span>
-                          <span className="text-green-400">{debugEAR.toFixed(3)}</span>
+                        <div className="flex justify-between text-gray-400 col-span-1">
+                          <span>EAR (client)</span>
+                          <span className={debugEAR < 0.22 ? "text-yellow-400" : "text-green-400"}>{debugEAR.toFixed(3)}</span>
                         </div>
                       )}
                       {debugLip !== null && (
-                        <div className="flex justify-between text-gray-400">
-                          <span>Lip Gap</span>
-                          <span className={debugLip > 6 ? "text-yellow-400" : "text-gray-500"}>{debugLip}px</span>
+                        <div className="flex justify-between text-gray-400 col-span-1">
+                          <span>Lip gap (client)</span>
+                          <span className={debugLip > 14 ? "text-yellow-400" : "text-gray-500"}>{debugLip}px</span>
                         </div>
                       )}
+                      {/* Server-side (MediaPipe) */}
+                      {serverFrameData?.ear != null && (
+                        <div className="flex justify-between text-gray-400 col-span-1">
+                          <span>EAR (server)</span>
+                          <span className={serverFrameData.ear < 0.22 ? "text-yellow-400" : "text-purple-400"}>{serverFrameData.ear.toFixed(3)}</span>
+                        </div>
+                      )}
+                      {serverFrameData?.mar != null && (
+                        <div className="flex justify-between text-gray-400 col-span-1">
+                          <span>MAR (server)</span>
+                          <span className={serverFrameData.mar > 0.6 ? "text-yellow-400" : "text-purple-400"}>{serverFrameData.mar.toFixed(3)}</span>
+                        </div>
+                      )}
+                      {serverFrameData && (
+                        <>
+                          <div className="flex justify-between text-gray-400 col-span-1">
+                            <span>Yaw</span>
+                            <span className="text-purple-400">{serverFrameData.yaw.toFixed(1)}°</span>
+                          </div>
+                          <div className="flex justify-between text-gray-400 col-span-1">
+                            <span>Pitch</span>
+                            <span className="text-purple-400">{serverFrameData.pitch.toFixed(1)}°</span>
+                          </div>
+                        </>
+                      )}
                       {antiSpoofScore !== null && (
-                        <div className="flex justify-between text-gray-400">
+                        <div className="flex justify-between text-gray-400 col-span-2 border-t border-white/5 pt-1.5 mt-0.5">
                           <span>Anti-Spoof Score</span>
                           <span className={antiSpoofScore >= 65 ? "text-green-400" : antiSpoofScore >= 40 ? "text-yellow-400" : "text-red-400"}>
                             {antiSpoofScore}/100
+                          </span>
+                        </div>
+                      )}
+                      {serverScore !== null && (
+                        <div className="flex justify-between text-gray-400 col-span-2">
+                          <span>MediaPipe Liveness</span>
+                          <span className={serverScore >= 75 ? "text-green-400" : serverScore >= 50 ? "text-yellow-400" : "text-purple-400"}>
+                            {serverScore}/100
                           </span>
                         </div>
                       )}
@@ -1170,6 +1277,55 @@ export default function Login() {
                   </div>
                 </div>
 
+                {/* ── MediaPipe Server-side Liveness Panel ───────────────── */}
+                {serverAvailable && pageState === "monitoring" && serverChecks && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                    className={`glass-panel rounded-3xl p-5 border transition-colors duration-500 ${
+                      serverIsLive ? "border-purple-500/30 bg-purple-500/5" : "border-white/10"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-2">
+                        <Zap className="w-4 h-4 text-purple-400" />
+                        <h3 className="text-sm font-bold text-white">MediaPipe Verification</h3>
+                        <span className="text-xs text-purple-400/60 font-mono">478 landmarks</span>
+                      </div>
+                      {serverScore !== null && (
+                        <span className={`text-sm font-bold font-mono ${serverScore >= 75 ? "text-purple-300" : "text-gray-400"}`}>
+                          {serverScore}/100
+                        </span>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {[
+                        { key: "blink_detected", label: "Eye Blink (EAR)",    icon: "👁" },
+                        { key: "lip_moved",       label: "Lip Move (MAR)",    icon: "👄" },
+                        { key: "head_moved",      label: `Head ${headChallenge.toUpperCase()}`, icon: "↔" },
+                        { key: "texture_ok",      label: "Skin Motion",       icon: "🌊" },
+                      ].map(({ key, label, icon }) => {
+                        const done = serverChecks[key as keyof ServerLivenessChecks];
+                        return (
+                          <div key={key} className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-xs transition-all duration-300 ${
+                            done ? "bg-purple-500/15 border-purple-500/30" : "bg-white/3 border-white/8"
+                          }`}>
+                            <span>{icon}</span>
+                            <span className={done ? "text-purple-300" : "text-gray-500"}>{label}</span>
+                            <span className="ml-auto">{done ? "✓" : "…"}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {serverFrameData && (
+                      <div className="mt-3 flex gap-4 text-xs font-mono text-gray-500">
+                        <span>Yaw: <span className="text-purple-400">{serverFrameData.yaw.toFixed(1)}°</span></span>
+                        <span>Pitch: <span className="text-purple-400">{serverFrameData.pitch.toFixed(1)}°</span></span>
+                        <span>Frames: <span className="text-gray-400">{serverFrameData.frame_count}</span></span>
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+
                 {/* ── Instructions ──────────────────────────────────────── */}
                 <div className="glass-panel rounded-3xl p-6 border-white/10">
                   <h3 className="text-base font-bold text-white mb-4 flex items-center gap-2">
@@ -1181,7 +1337,9 @@ export default function Login() {
                       "Position your real face inside the scan frame",
                       "Blink your eyes naturally (close fully, then open)",
                       "Open your mouth, then close it slowly",
-                      "Gently tilt or turn your head left or right",
+                      headChallenge === "up"
+                        ? "Slowly tilt your head upward and hold briefly"
+                        : `Slowly turn your head to the ${headChallenge.toUpperCase()} and hold briefly`,
                       "Good lighting helps — avoid backlight or shadows",
                       "Do not use a photo, screen or video of a face",
                     ].map((tip, i) => (

@@ -98,6 +98,25 @@ router.post("/register-face", async (req, res) => {
   }
 });
 
+// ── Liveness session verifier (calls Python service) ─────────────────────────
+
+async function verifyLivenessSession(
+  sessionId: string,
+): Promise<{ is_live: boolean; liveness_score: number; reason: string; checks: Record<string, boolean> } | null> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    const res = await fetch(`${ANTI_SPOOF_URL}/liveness/verify/${sessionId}`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return await res.json() as { is_live: boolean; liveness_score: number; reason: string; checks: Record<string, boolean> };
+  } catch {
+    return null;
+  }
+}
+
 // ── POST /api/login-face ──────────────────────────────────────────────────────
 
 router.post("/login-face", async (req, res) => {
@@ -109,10 +128,41 @@ router.post("/login-face", async (req, res) => {
 
   const { email, face_descriptor, liveness_passed } = parsed.data;
 
-  // ── Client-side liveness check (first gate) ───────────────────────────────
+  // ── Gate 1a: Client-side liveness (legacy flag) ───────────────────────────
   if (!liveness_passed) {
     res.status(401).json({ error: "Liveness verification failed" });
     return;
+  }
+
+  // ── Gate 1b: Server-side MediaPipe liveness session (if provided) ─────────
+  const livenessSessionId: string | null =
+    typeof req.body.liveness_session_id === "string" && req.body.liveness_session_id.length > 10
+      ? req.body.liveness_session_id
+      : null;
+
+  if (livenessSessionId) {
+    const livenessResult = await verifyLivenessSession(livenessSessionId);
+    if (livenessResult === null) {
+      console.error(`[liveness] Session verify failed for ${email} — service unreachable`);
+      res.status(503).json({ error: "Liveness verification service unavailable. Please try again." });
+      return;
+    }
+    if (!livenessResult.is_live) {
+      console.warn(
+        `[liveness] Session ${livenessSessionId} rejected for ${email}: score=${livenessResult.liveness_score} reason="${livenessResult.reason}"`,
+      );
+      res.status(401).json({
+        error:           "Server-side liveness verification failed. Please complete all checks and try again.",
+        liveness_score:  livenessResult.liveness_score,
+        reason:          livenessResult.reason,
+        checks:          livenessResult.checks,
+      });
+      return;
+    }
+    console.log(`[liveness] Session ${livenessSessionId} verified for ${email}: score=${livenessResult.liveness_score}`);
+
+    // Clean up session asynchronously (don't block login)
+    fetch(`${ANTI_SPOOF_URL}/liveness/session/${livenessSessionId}`, { method: "DELETE" }).catch(() => {});
   }
 
   // ── Server-side anti-spoofing (second gate, mandatory) ───────────────────
