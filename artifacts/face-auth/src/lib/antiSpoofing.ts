@@ -144,25 +144,26 @@ export class AntiSpoofEngine {
       motionConsistency* 0.15
     );
 
-    // Catastrophic single-signal overrides
+    // Catastrophic single-signal overrides — only fire on extreme values
+    // that no real webcam face would produce
     const anyCatastrophic =
-      glare            < 15 ||
-      texture          < 15 ||
-      temporalVariance < 10;   // Near-zero motion = static image
+      glare            < 10 ||   // near-total screen glare (real face: rarely < 15)
+      texture          < 10 ||   // near-zero texture (real face: rarely < 20)
+      temporalVariance < 3;      // truly static — no motion at all (real face: always some micro-motion)
 
-    // ── Raised threshold: 58 (was 42) ────────────────────────────────────────
-    const isReal = score >= 58 && !anyCatastrophic;
+    // ── Threshold 45 (permissive but still catches obvious spoofs) ───────────
+    const isReal = score >= 45 && !anyCatastrophic;
 
     // ── Reason string ─────────────────────────────────────────────────────────
     let reason = "Face appears genuine";
     if (!isReal) {
-      if (temporalVariance < 10) {
+      if (temporalVariance < 3) {
         reason = "No natural face motion detected — static image likely";
-      } else if (motionConsistency < 20) {
+      } else if (motionConsistency < 15) {
         reason = "Motion pattern too regular — possible screen or printed photo";
-      } else if (glare < 20) {
-        reason = "Screen glare / reflection detected";
-      } else if (texture < 20) {
+      } else if (glare < 15) {
+        reason = "Strong screen glare / reflection detected";
+      } else if (texture < 15) {
         reason = "Skin micro-texture appears artificial (photo or screen)";
       } else if (colorNaturalness < 25) {
         reason = "Unnatural colour distribution in face region";
@@ -174,7 +175,7 @@ export class AntiSpoofEngine {
     return {
       isReal,
       score,
-      confidence: score >= 75 ? "high" : score >= 60 ? "medium" : "low",
+      confidence: score >= 70 ? "high" : score >= 50 ? "medium" : "low",
       reason,
       signals: {
         glare:             Math.round(glare),
@@ -191,9 +192,10 @@ export class AntiSpoofEngine {
   /**
    * Signal 1 — Glare / Specular detection.
    *
-   * Threshold tightened: "safe zone" lowered from 4% → 1.5% super-bright
-   * pixels.  Modern anti-reflective phone screens still typically reflect
-   * ≥ 2% of ambient light as near-white hotspots in typical indoor conditions.
+   * Safe zone raised from 1.5% → 4.5%.  Real faces in typical indoor /
+   * office lighting (overhead fluorescents, window light) routinely produce
+   * 2-4% super-bright pixels on the forehead, nose tip, and cheek-bones.
+   * Bright pixels only become a strong spoof indicator above ~20%.
    */
   private _detectGlare(gray: Uint8ClampedArray): number {
     const THRESHOLD = 235;
@@ -203,19 +205,20 @@ export class AntiSpoofEngine {
     }
     const ratio = hotPixels / gray.length;
 
-    // ≤ 1.5% → safe (score 100); ≥ 16% → clear spoof (score 0)
-    if (ratio <= 0.015) return 100;
-    if (ratio >= 0.16)  return 0;
-    return Math.round((1 - (ratio - 0.015) / 0.145) * 100);
+    // ≤ 4.5% → safe (score 100); ≥ 22% → clear spoof (score 0)
+    if (ratio <= 0.045) return 100;
+    if (ratio >= 0.22)  return 0;
+    return Math.round((1 - (ratio - 0.045) / 0.175) * 100);
   }
 
   /**
    * Signal 2 — LBP micro-texture entropy.
    *
-   * Threshold tightened: "definitely real" normalised entropy raised from
-   * 0.72 → 0.80.  Real skin at close range scores 0.85-0.95.
-   * A high-quality phone photo typically scores 0.70-0.82 — this change
-   * ensures borderline screen captures no longer receive a full 100 score.
+   * Real zone lowered from 0.80 → 0.70.  Webcam-compressed JPEG video has
+   * lower LBP entropy than a high-resolution still photo — real skin through
+   * a typical laptop/external webcam typically scores 0.72-0.90, so 0.80
+   * was cutting off genuine users.  Phone-screen spoofs score 0.60-0.75
+   * when rendered at arm's length; the 0.70 floor still penalises them.
    */
   private _computeLBPEntropy(gray: Uint8ClampedArray): number {
     const W = this.SIZE;
@@ -255,10 +258,10 @@ export class AntiSpoofEngine {
     }
 
     const normalised = entropy / 8;
-    // Tighter: real zone starts at 0.80 (was 0.72), spoof zone below 0.42 (was 0.38)
-    if (normalised >= 0.80) return 100;
-    if (normalised <= 0.42) return 0;
-    return Math.round(((normalised - 0.42) / 0.38) * 100);
+    // Real zone starts at 0.70; spoof zone below 0.38
+    if (normalised >= 0.70) return 100;
+    if (normalised <= 0.38) return 0;
+    return Math.round(((normalised - 0.38) / 0.32) * 100);
   }
 
   /**
@@ -331,40 +334,33 @@ export class AntiSpoofEngine {
   }
 
   /**
-   * Signal 5 — Motion Consistency (NEW in v3).
+   * Signal 5 — Motion Consistency.
    *
-   * Coefficient of Variation (CoV = std/mean) of the recent MAD history:
+   * Coefficient of Variation (CoV = std/mean) of the recent MAD history.
+   * Low CoV = suspiciously regular motion (phone tremor).
+   * High CoV = irregular organic micro-motion (real face).
    *
-   *   Hand tremor  → near-constant MAD (regular 8-12 Hz tremor sampled at
-   *                  ~5 Hz appears as slow oscillation with low CoV ≈ 0.05-0.20)
-   *
-   *   Organic face → irregular micro-motion — breathing pauses, micro-
-   *                  expressions, eye movements create bursts with high
-   *                  CoV ≈ 0.40-0.90
-   *
-   * Therefore: LOW CoV = suspiciously regular = spoof signal.
-   * Requires at least 6 samples to produce a meaningful estimate.
-   *
-   * IMPORTANT: this signal is only meaningful when significant motion is
-   * present (avg MAD > 0.5).  When the face is nearly static we return
-   * neutral (50) to avoid double-penalising with Signal 4.
+   * Calibration loosened so a calm person sitting still doesn't get penalised:
+   *   CoV < 0.08 → only extremely rigid tremor → spoof (score 0)
+   *   CoV > 0.35 → clearly irregular → real   (score 100)
+   * Requires 10 samples so transient startup noise doesn't skew the reading.
    */
   private _computeMotionConsistency(): number {
     const h = this.motionHistory;
-    if (h.length < 6) return 50; // Not enough history yet
+    if (h.length < 10) return 60; // Return slightly positive while warming up
 
     const avg = h.reduce((s, v) => s + v, 0) / h.length;
-    if (avg < 0.5) return 50; // Nearly static — let Signal 4 handle it
+    if (avg < 0.4) return 55; // Nearly static — neutral, let Signal 4 handle it
 
     const variance = h.reduce((s, v) => s + (v - avg) ** 2, 0) / h.length;
     const std      = Math.sqrt(variance);
     const cov      = std / (avg + 1e-6);
 
     // Calibration:
-    //   CoV < 0.20 → suspiciously consistent → spoof → score 0
-    //   CoV > 0.55 → organic irregularity    → real  → score 100
-    if (cov >= 0.55) return 100;
-    if (cov <= 0.20) return 0;
-    return Math.round(((cov - 0.20) / 0.35) * 100);
+    //   CoV < 0.08 → robotically rigid → spoof → score 0
+    //   CoV > 0.35 → organic irregularity → real → score 100
+    if (cov >= 0.35) return 100;
+    if (cov <= 0.08) return 0;
+    return Math.round(((cov - 0.08) / 0.27) * 100);
   }
 }

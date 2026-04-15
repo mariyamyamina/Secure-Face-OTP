@@ -58,7 +58,7 @@ const DETECTION_INTERVAL_MS  = 200;   // Face detection tick rate
 const LIVENESS_TIMEOUT_S     = 45;    // Total time allowed for liveness (extended for server checks)
 const ANTI_SPOOF_INTERVAL    = 2;     // Run anti-spoof every N-th detection tick
 const ANTI_SPOOF_WARMUP      = 4;     // Skip anti-spoof for first N ticks (warm-up)
-const SPOOF_REJECT_COUNT     = 2;     // Consecutive "spoof" readings before rejection
+const SPOOF_REJECT_COUNT     = 5;     // Consecutive "spoof" readings before rejection
 const SERVER_FRAME_INTERVAL  = 5;     // Send frame to MediaPipe server every N ticks
 
 // ── Types ──────────────────────────────────────────────────────────────────────

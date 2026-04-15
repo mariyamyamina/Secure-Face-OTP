@@ -642,7 +642,7 @@ def _liveness_failure_reason(session: LivenessSession) -> str:
 # PASSIVE SPOOF-DETECTION PIPELINE (v2, unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SPOOF_THRESHOLD = 38
+SPOOF_THRESHOLD = 52          # Raised from 38 — reduces false positives from room edges
 
 class FaceBoundsModel(BaseModel):
     x: float
@@ -831,11 +831,13 @@ WEIGHTS = {
 
 
 def combine(fft: int, lbp: int, orient: int, border: int, cov: int) -> tuple[int, str]:
-    if border >= 75:
+    # Early-return thresholds raised to avoid false positives from room edges,
+    # JPEG artefacts, and background features.
+    if border >= 90:
         return 82, "Screen border / frame edges detected — phone or monitor in view."
-    if fft >= 80:
+    if fft >= 88:
         return 78, "Strong periodic frequency pattern detected (screen rendering artefacts)."
-    if lbp >= 85 and cov >= 80:
+    if lbp >= 90 and cov >= 88:
         return 72, "Unnatural texture uniformity consistent with a printed or screen image."
     score = int(
         border * WEIGHTS["screen_border"]        +
