@@ -68,11 +68,11 @@ const LIP_OPEN_PX  = 14;
 const LIP_CLOSE_PX = 4;
 
 /**
- * Head movement: nose tip must shift ≥ 18 px IN THE REQUIRED DIRECTION.
- * Raised from 8 → 18 px; phone tilt or landmark noise (≤ 4 px) cannot
- * satisfy this, and the DIRECTION requirement defeats video replay.
+ * Head movement: nose tip must shift ≥ 10 px IN THE REQUIRED DIRECTION.
+ * Lowered from 18 → 10 px for speed; the randomised DIRECTION requirement
+ * is the primary replay-defence — distance is secondary.
  */
-const HEAD_MOVE_PX = 18;
+const HEAD_MOVE_PX = 10;
 
 /**
  * Skin texture: minimum MAD (Mean Absolute Difference) between frames.
@@ -82,8 +82,8 @@ const HEAD_MOVE_PX = 18;
  */
 const TEXTURE_MAD_THRESHOLD = 2.0;
 
-const TEXTURE_WINDOW      = 8;
-const TEXTURE_PASSING_MIN = 5;
+const TEXTURE_WINDOW      = 5;   // Reduced from 8 for faster completion
+const TEXTURE_PASSING_MIN = 3;   // Reduced from 5 for faster completion
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -311,9 +311,10 @@ export class LivenessDetector {
       this.prevPixels = gray;
     }
 
+    // Lip movement is tracked for UI feedback but NOT required to pass.
+    // Blink + directional head turn + texture are sufficient for liveness.
     const allPassed =
       this.state.blinkDetected &&
-      this.state.lipMovementDetected &&
       this.state.headMovementDetected &&
       this.state.textureDetected;
 

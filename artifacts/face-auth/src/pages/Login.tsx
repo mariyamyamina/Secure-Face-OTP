@@ -54,12 +54,12 @@ import { ServerLivenessClient, type ServerLivenessChecks, type ServerLivenessFra
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const MODEL_URL              = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/";
-const DETECTION_INTERVAL_MS  = 200;   // Face detection tick rate
-const LIVENESS_TIMEOUT_S     = 45;    // Total time allowed for liveness (extended for server checks)
-const ANTI_SPOOF_INTERVAL    = 2;     // Run anti-spoof every N-th detection tick
-const ANTI_SPOOF_WARMUP      = 4;     // Skip anti-spoof for first N ticks (warm-up)
-const SPOOF_REJECT_COUNT     = 5;     // Consecutive "spoof" readings before rejection
-const SERVER_FRAME_INTERVAL  = 5;     // Send frame to MediaPipe server every N ticks
+const DETECTION_INTERVAL_MS  = 100;   // Face detection tick rate (~10 fps)
+const LIVENESS_TIMEOUT_S     = 30;    // Total time allowed for liveness
+const ANTI_SPOOF_INTERVAL    = 3;     // Run anti-spoof every N-th detection tick
+const ANTI_SPOOF_WARMUP      = 1;     // Skip anti-spoof for first N ticks (minimal warm-up)
+const SPOOF_REJECT_COUNT     = 8;     // Consecutive "spoof" readings before rejection (adjusted for faster tick)
+const SERVER_FRAME_INTERVAL  = 8;     // Send frame to MediaPipe server every N ticks
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -82,7 +82,6 @@ function buildInstructions(headDir: "left" | "right" | "up") {
                           "➡️  Slowly turn your head to the RIGHT";
   return [
     { key: "blinkDetected"        as const, text: "👁  Blink your eyes once naturally" },
-    { key: "lipMovementDetected"  as const, text: "👄  Open and then close your mouth" },
     { key: "headMovementDetected" as const, text: headText },
     { key: "textureDetected"      as const, text: "✅  Hold still — detecting skin texture…" },
   ];
@@ -341,14 +340,14 @@ export default function Login() {
       // runs OpenCV-based frequency, texture, and glare analysis on it.
       const faceImageB64: string | null = webcamRef.current?.getScreenshot() ?? null;
 
-      // ── Capture 3 face descriptors and average them ────────────────────
-      // Three samples over 600 ms smooth lighting/angle noise.
-      const SAMPLES     = 3;
+      // ── Capture 2 face descriptors and average them ────────────────────
+      // Two samples with a short gap to smooth lighting/angle noise.
+      const SAMPLES     = 2;
       const descriptors: Float32Array[] = [];
       let   capturedBounds: { x: number; y: number; width: number; height: number } | null = null;
 
       for (let i = 0; i < SAMPLES; i++) {
-        if (i > 0) await new Promise(r => setTimeout(r, 300));
+        if (i > 0) await new Promise(r => setTimeout(r, 100));
         const det = await faceapi
           .detectSingleFace(
             video,
@@ -656,7 +655,6 @@ export default function Login() {
 
   const checks = [
     { key: "blinkDetected"        as const, label: "Eye Blink",         icon: Eye,    hint: "Blink your eyes once" },
-    { key: "lipMovementDetected"  as const, label: "Lip Movement",      icon: Smile,  hint: "Open and close your mouth" },
     { key: "headMovementDetected" as const, label: "Head Movement",     icon: Move,   hint: headHint },
     { key: "textureDetected"      as const, label: "Real Skin Texture", icon: Layers, hint: "Hold still in frame" },
   ];
@@ -1336,7 +1334,6 @@ export default function Login() {
                     {[
                       "Position your real face inside the scan frame",
                       "Blink your eyes naturally (close fully, then open)",
-                      "Open your mouth, then close it slowly",
                       headChallenge === "up"
                         ? "Slowly tilt your head upward and hold briefly"
                         : `Slowly turn your head to the ${headChallenge.toUpperCase()} and hold briefly`,
